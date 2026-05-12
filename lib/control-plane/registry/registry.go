@@ -15,13 +15,13 @@ type Registry struct {
 	backends map[string]*BackendEntry // keyed by IP str
 }
 
-func create_registry() *Registry {
+func CreateRegistry() *Registry {
 	return &Registry{
 		backends: make(map[string]*BackendEntry),
 	}
 }
 
-func (r *Registry) registerBackendEntry(pool Pool, ip net.IP, port uint16, mac net.HardwareAddr) {
+func (r *Registry) RegisterBackendEntry(pool Pool, ip net.IP, port uint16) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
@@ -37,7 +37,6 @@ func (r *Registry) registerBackendEntry(pool Pool, ip net.IP, port uint16, mac n
 		Pool:       pool,
 		IP:         ip,
 		Port:       port,
-		MAC:        mac,
 		LoadScore:  0, // initial load score, in the future the load will be a function parameter, received by the appropiate handler
 		LastSeen:   current_time,
 		Registered: current_time,
@@ -47,7 +46,7 @@ func (r *Registry) registerBackendEntry(pool Pool, ip net.IP, port uint16, mac n
 	log.Printf("[REGISTRY] Registered device: %s:%d (%s)", ip, port, pool)
 }
 
-func (r *Registry) receivedHeartbeat(ip net.IP) {
+func (r *Registry) HandleHeartbeat(ip net.IP) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
@@ -63,7 +62,7 @@ func (r *Registry) receivedHeartbeat(ip net.IP) {
 	log.Printf("[REGISTRY] Received heartbeat from unknown device: %s", ip)
 }
 
-func (r *Registry) removeDeadBackendEntries(maxAge time.Duration) []BackendEntry {
+func (r *Registry) RemoveDeadBackendEntries(maxAge time.Duration) []BackendEntry {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
