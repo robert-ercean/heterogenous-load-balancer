@@ -58,7 +58,7 @@ func handlePacket(conn *net.UDPConn, reg *registry.Registry, src *net.UDPAddr, p
 		}
 
 	case MsgHeartbeat:
-		reg.HandleHeartbeat(src.IP)
+		reg.HandleUDPHeartbeat(src.IP)
 
 	default:
 		log.Printf("[UDP_LISTENER] Unknown msg type 0x%02X from %s", msgType, src.IP)

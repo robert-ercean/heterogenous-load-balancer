@@ -5,7 +5,7 @@ set -e
 echo "Removing virtual switch + backend Docker containers"
 
 BR_NAME="br0"
-DOCKER_NET="lb-backend"
+DOCKER_NET="lb-backends"
 
 CONTAINERS=(
   tcp-backend-1

@@ -1,4 +1,4 @@
-package controlplane
+package main
 
 import (
 	"log"
@@ -7,21 +7,30 @@ import (
 	"syscall"
 	"time"
 
+	"lb/control-plane/httplistener"
 	"lb/control-plane/registry"
 	"lb/control-plane/udplistener"
 )
 
 func main() {
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
-	log.Println("[main] starting control plane")
+	log.Println("[MAIN] starting control plane")
 
 	reg := registry.CreateRegistry()
-	listenPort := ":9998"
+	UDPlistenPort := ":9999"
+	HTTPlistenPort := ":9998"
 
 	// Start UDP listener for UDP backends
 	go func() {
-		if err := udplistener.Start(listenPort, reg); err != nil {
-			log.Fatalf("[main] UDP listener failed: %v", err)
+		if err := udplistener.Start(UDPlistenPort, reg); err != nil {
+			log.Fatalf("[MAIN] UDP listener failed: %v", err)
+		}
+	}()
+
+	// Start HTTP listener for TCP backends
+	go func() {
+		if err := httplistener.Start(HTTPlistenPort, reg); err != nil {
+			log.Fatalf("[MAIN] HTTP listener failed: %v", err)
 		}
 	}()
 
@@ -36,7 +45,7 @@ func main() {
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
 	<-sig
 
-	log.Println("[main] shutting down")
+	log.Println("[MAIN] shutting down")
 }
 
 func loopForDeadDevices(reg *registry.Registry) {
@@ -56,7 +65,7 @@ func reportLoop(reg *registry.Registry) {
 	defer ticker.Stop()
 	for range ticker.C {
 		backends := reg.Stringify()
-		log.Printf("[main] %d backends registered:", len(backends))
+		log.Printf("[MAIN] %d backends registered:", len(backends))
 		for _, b := range backends {
 			log.Printf("        %s pool=%s port=%d load=%d last_seen=%s ago",
 				b.IP, b.Pool, b.Port, b.LoadScore,

@@ -46,35 +46,46 @@ func (r *Registry) RegisterBackendEntry(pool Pool, ip net.IP, port uint16) {
 	log.Printf("[REGISTRY] Registered device: %s:%d (%s)", ip, port, pool)
 }
 
-func (r *Registry) HandleHeartbeat(ip net.IP) {
+func (r *Registry) HandleUDPHeartbeat(ip net.IP) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
 	key := ip.String()
 	current_time := time.Now()
 
-	if backendEntry, ok := r.backends[key]; ok {
+	if backendEntry, ok := r.backends[key]; ok && backendEntry.Pool == PoolUDP {
 		backendEntry.LastSeen = current_time
-		log.Printf("[REGISTRY] Received heartbeat from: %s", ip)
+		log.Printf("[REGISTRY] Received UDP heartbeat from: %s", ip)
 		return
 	}
 
-	log.Printf("[REGISTRY] Received heartbeat from unknown device: %s", ip)
+	log.Printf("[REGISTRY] Received UDP heartbeat from unknown device, or the device is not registered as UDP: %s", ip)
 }
 
-func (r *Registry) RemoveDeadBackendEntries(maxAge time.Duration) []BackendEntry {
+func (r *Registry) RemoveDeadBackendEntries(staleThreshold time.Duration) []BackendEntry {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	cutoff := time.Now().Add(-maxAge)
+	cutoff := time.Now().Add(-staleThreshold)
 	var removed []BackendEntry
 	for k, b := range r.backends {
 		if b.LastSeen.Before(cutoff) {
 			removed = append(removed, *b)
 			delete(r.backends, k)
-			log.Printf("[REGISTRY] Removed dead backend %s:%d (last seen %s ago)",
-				b.IP, b.Port, time.Since(b.LastSeen).Round(time.Second))
+			log.Printf("[REGISTRY] Removed dead %s backend %s:%d (last seen %s ago)",
+				b.Pool, b.IP, b.Port, time.Since(b.LastSeen).Round(time.Second))
 		}
 	}
 	return removed
+}
+
+func (r *Registry) Stringify() []BackendEntry {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	var entries []BackendEntry
+	for _, b := range r.backends {
+		entries = append(entries, *b)
+	}
+	return entries
 }
