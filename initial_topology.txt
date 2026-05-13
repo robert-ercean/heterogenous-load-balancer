@@ -1,0 +1,8 @@
+[Client]
+   │
+[Router] ── (ethernet) ── [LB Machine]
+                                  │
+                                  ├── eth0 (faces router, XDP hook attached)
+                                  │
+                                  │
+                                  └── br0 (faces simulated backends aka docker containers, TC BPF hook attached)

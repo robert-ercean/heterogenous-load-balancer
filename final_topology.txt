@@ -1,0 +1,20 @@
+[Client]
+   │
+[Router]
+   │ (ethernet cable)
+   │
+   |── eth0 (faces router)        ← XDP hook here
+[LB Machine]
+   │
+   |
+   │
+   │
+   └── eth1 (faces switch)        ← TC BPF hook here
+          receives backend reply traffic
+   │
+   │ (ethernet cable)
+   |
+[Switch]
+   │
+   ├── [Backend Machine] (containers)
+   └── [Physical backends]
