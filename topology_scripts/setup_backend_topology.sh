@@ -7,10 +7,31 @@ BR_NAME="br0"
 BR_IP="172.16.0.1/24"
 BR_IP_NO_MASK="172.16.0.1"
 
-TCP_B1_IP="172.16.0.11"
-TCP_B2_IP="172.16.0.12"
-UDP_B1_IP="172.16.0.21"
-UDP_B2_IP="172.16.0.22"
+TCP_IPS=(
+  "172.16.0.10"
+  "172.16.0.11"
+  "172.16.0.12"
+  "172.16.0.13"
+  "172.16.0.14"
+  "172.16.0.15"
+  "172.16.0.16"
+  "172.16.0.17"
+  "172.16.0.18"
+  "172.16.0.19"
+)
+
+UDP_IPS=(
+  "172.16.0.21"
+  "172.16.0.22"
+  "172.16.0.23"
+  "172.16.0.24"
+  "172.16.0.25"
+  "172.16.0.26"
+  "172.16.0.27"
+  "172.16.0.28"
+  "172.16.0.29"
+  "172.16.0.30"
+)
 
 # Where the agent binaries live on the host
 TCP_AGENT_BIN="/home/robert/Desktop/lb/backend_devices_scripts/tcp/tcp_register"
@@ -54,51 +75,43 @@ docker network create \
   || echo "      docker network lb-backends already exists, skipping"
 
 # Clean up any existing containers
-for c in tcp-backend-1 tcp-backend-2 udp-backend-1 udp-backend-2; do
-    docker rm -f $c 2>/dev/null || true
+for i in $(seq 1 10); do
+    docker rm -f "tcp-backend-$i" 2>/dev/null || true
+    docker rm -f "udp-backend-$i" 2>/dev/null || true
 done
 
 # ─── Step 4: TCP backends ──────────────────────────────────────
 echo "[4/5] Creating TCP backends..."
 
-docker run -d \
-  --name tcp-backend-1 \
-  --network lb-backends \
-  --ip $TCP_B1_IP \
-  --cpus 1.0 \
-  --memory 256m \
-  -v "$TCP_AGENT_BIN:/agent:ro" \
-  alpine /agent --cp $CP_HTTP_ADDR --port 50051
 
-docker run -d \
-  --name tcp-backend-2 \
-  --network lb-backends \
-  --ip $TCP_B2_IP \
-  --cpus 1.0 \
-  --memory 256m \
-  -v "$TCP_AGENT_BIN:/agent:ro" \
-  alpine /agent --cp $CP_HTTP_ADDR --port 50051
+for i in "${!TCP_IPS[@]}"; do
+  n=$((i + 1))
+
+  docker run -d \
+    --name "tcp-backend-$n" \
+    --network lb-backends \
+    --ip "${TCP_IPS[$i]}" \
+    --cpus 0.3 \
+    --memory 256m \
+    -v "$TCP_AGENT_BIN:/agent:ro" \
+    alpine /agent --cp "$CP_HTTP_ADDR" --port 50051
+done
 
 # ─── Step 5: UDP backends ──────────────────────────────────────
 echo "[5/5] Creating UDP backends..."
 
-docker run -d \
-  --name udp-backend-1 \
-  --network lb-backends \
-  --ip $UDP_B1_IP \
-  --cpus 0.2 \
-  --memory 256m \
-  -v "$UDP_AGENT_BIN:/agent:ro" \
-  alpine /agent --cp $CP_UDP_ADDR --port 9000
+for i in "${!UDP_IPS[@]}"; do
+  n=$((i + 1))
 
-docker run -d \
-  --name udp-backend-2 \
-  --network lb-backends \
-  --ip $UDP_B2_IP \
-  --cpus 0.2 \
-  --memory 256m \
-  -v "$UDP_AGENT_BIN:/agent:ro" \
-  alpine /agent --cp $CP_UDP_ADDR --port 9000
+  docker run -d \
+    --name "udp-backend-$n" \
+    --network lb-backends \
+    --ip "${UDP_IPS[$i]}" \
+    --cpus 0.1 \
+    --memory 32m \
+    -v "$UDP_AGENT_BIN:/agent:ro" \
+    alpine /agent --cp "$CP_UDP_ADDR" --port 9000
+done
 
 echo ""
 echo "=== Topology ready ==="
