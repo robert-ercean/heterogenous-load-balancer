@@ -64,7 +64,7 @@ func reportLoop(reg *registry.Registry) {
 	ticker := time.NewTicker(10 * time.Second)
 	defer ticker.Stop()
 	for range ticker.C {
-		backends := reg.Stringify()
+		backends := reg.Listify()
 		log.Printf("[MAIN] %d backends registered:", len(backends))
 		for _, b := range backends {
 			log.Printf("        %s pool=%s port=%d load=%d last_seen=%s ago",

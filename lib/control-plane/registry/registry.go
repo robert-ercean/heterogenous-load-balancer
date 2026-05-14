@@ -37,7 +37,7 @@ func (r *Registry) RegisterBackendEntry(pool Pool, ip net.IP, port uint16) {
 		Pool:       pool,
 		IP:         ip,
 		Port:       port,
-		LoadScore:  0, // initial load score, in the future the load will be a function parameter, received by the appropiate handler
+		LoadScore:  1,
 		LastSeen:   current_time,
 		Registered: current_time,
 	}
@@ -62,7 +62,7 @@ func (r *Registry) HandleUDPHeartbeat(ip net.IP) {
 	log.Printf("[REGISTRY] Received UDP heartbeat from unknown device, or the device is not registered as UDP: %s", ip)
 }
 
-func (r *Registry) RemoveDeadBackendEntries(staleThreshold time.Duration) []BackendEntry {
+func (r *Registry) RemoveDeadUDPBackend(staleThreshold time.Duration) []BackendEntry {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
@@ -72,14 +72,35 @@ func (r *Registry) RemoveDeadBackendEntries(staleThreshold time.Duration) []Back
 		if b.LastSeen.Before(cutoff) {
 			removed = append(removed, *b)
 			delete(r.backends, k)
-			log.Printf("[REGISTRY] Removed dead %s backend %s:%d (last seen %s ago)",
-				b.Pool, b.IP, b.Port, time.Since(b.LastSeen).Round(time.Second))
+			log.Printf("[REGISTRY] Removed dead UDP backend %s:%d (last seen %s ago)",
+				b.IP, b.Port, time.Since(b.LastSeen).Round(time.Second))
 		}
 	}
 	return removed
 }
 
-func (r *Registry) Stringify() []BackendEntry {
+// UpdateLoadScore sets the load score and refreshes LastSeen for the backend
+// at the given IP. Returns false if the backend isn't registered.
+func (r *Registry) UpdateLoadScore(ip net.IP, score uint32) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	if b, ok := r.backends[ip.String()]; ok {
+		b.LoadScore = score
+		b.LastSeen = time.Now()
+		return true
+	}
+	return false
+}
+
+// Removes a backend from the registry.
+func (r *Registry) Remove(ip net.IP) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	delete(r.backends, ip.String())
+}
+
+func (r *Registry) Listify() []BackendEntry {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 
