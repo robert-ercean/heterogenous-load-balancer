@@ -1,18 +1,28 @@
 package main
 
 import (
+	"context"
 	"log"
 	"os"
 	"os/signal"
 	"syscall"
 	"time"
 
+	"lb/control-plane/healthpoller"
+	"lb/control-plane/heartbeatpruner"
 	"lb/control-plane/httplistener"
 	"lb/control-plane/registry"
 	"lb/control-plane/udplistener"
 )
 
+const (
+	reportIntervalSec = 10 * time.Second
+)
+
 func main() {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
 	log.Println("[MAIN] starting control plane")
 
@@ -34,8 +44,13 @@ func main() {
 		}
 	}()
 
-	// Start stale backend pruner
-	go loopForDeadDevices(reg)
+	// Start stale UDP backends pruner
+	pruner := heartbeatpruner.New(reg)
+	go pruner.Run()
+
+	// Start health poller for TCP backends
+	poller := healthpoller.New(reg)
+	go poller.Run(ctx)
 
 	// Print registry state every 10s for visibility
 	go reportLoop(reg)
@@ -48,20 +63,8 @@ func main() {
 	log.Println("[MAIN] shutting down")
 }
 
-func loopForDeadDevices(reg *registry.Registry) {
-	loopInterval := 5 * time.Second
-	staleThreshold := 15 * time.Second
-
-	ticker := time.NewTicker(loopInterval)
-	defer ticker.Stop()
-
-	for range ticker.C {
-		reg.RemoveDeadBackendEntries(staleThreshold)
-	}
-}
-
 func reportLoop(reg *registry.Registry) {
-	ticker := time.NewTicker(10 * time.Second)
+	ticker := time.NewTicker(reportIntervalSec)
 	defer ticker.Stop()
 	for range ticker.C {
 		backends := reg.Listify()

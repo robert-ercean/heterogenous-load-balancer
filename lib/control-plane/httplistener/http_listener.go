@@ -23,8 +23,6 @@ func Start(addr string, reg *registry.Registry) error {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/register", makeRegisterHandler(reg))
 
-	// TODO: mux.HandleFunc("/health", healthCheckHandler(reg))
-
 	log.Printf("[HTTP_LISTENER] listening on %s", addr)
 	return http.ListenAndServe(addr, mux)
 }

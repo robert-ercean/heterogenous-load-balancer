@@ -44,7 +44,7 @@ func New(reg *registry.Registry) *Poller {
 
 // Run blocks until ctx is canceled, polling all TCP backends on a fixed interval.
 func (p *Poller) Run(ctx context.Context) {
-	log.Printf("[HEALTH_POLLER] starting, interval=%ds timeout=%ds", PollIntervalSec, PollTimeoutSec)
+	log.Printf("[TCP_HEALTH_POLLER] starting, interval=%ds timeout=%ds", PollIntervalSec, PollTimeoutSec)
 
 	ticker := time.NewTicker(PollIntervalSec * time.Second)
 	defer ticker.Stop()
@@ -52,7 +52,7 @@ func (p *Poller) Run(ctx context.Context) {
 	for {
 		select {
 		case <-ctx.Done():
-			log.Printf("[HEALTH_POLLER] shutting down")
+			log.Printf("[TCP_HEALTH_POLLER] shutting down")
 			return
 		case <-ticker.C:
 			p.pollAll()
@@ -82,15 +82,17 @@ func (p *Poller) pollOne(b registry.BackendEntry) {
 	metricsPort := 8080
 	url := fmt.Sprintf("http://%s:%d/metrics", b.IP, metricsPort)
 
+	log.Printf("[TCP_HEALTH_POLLER] polling %s at %s", b.IP, url)
 	metrics, err := p.fetchMetrics(url)
 	if err != nil {
 		p.recordFailure(b.IP, err)
 		return
 	}
+	log.Printf("[TCP_HEALTH_POLLER] Received metrics from %s: CPU=%.1f%% MEM=%.1f%%", b.IP, metrics.CPUPercent, metrics.MemoryPercent)
 
 	score := computeLoadScore(metrics)
 	if !p.reg.UpdateLoadScore(b.IP, score) {
-		log.Printf("[HEALTH_POLLER] backend %s not in registry, ignoring metrics", b.IP)
+		log.Printf("[TCP_HEALTH_POLLER] backend %s not in registry, ignoring metrics", b.IP)
 		return
 	}
 
@@ -125,10 +127,10 @@ func (p *Poller) recordFailure(ip net.IP, err error) {
 	p.failCounts[key]++
 	count := p.failCounts[key]
 
-	log.Printf("[HEALTH_POLLER] poll failed for %s (consecutive=%d): %v", ip, count, err)
+	log.Printf("[TCP_HEALTH_POLLER] poll failed for %s (consecutive=%d): %v", ip, count, err)
 
 	if count >= MaxConsecutiveFails {
-		log.Printf("[HEALTH_POLLER] removing %s after %d consecutive failures", ip, count)
+		log.Printf("[TCP_HEALTH_POLLER] removing %s after %d consecutive failures", ip, count)
 		p.reg.Remove(ip)
 		delete(p.failCounts, key)
 	}
@@ -139,19 +141,25 @@ func (p *Poller) recordSuccess(ip net.IP) {
 	defer p.failsMu.Unlock()
 
 	if p.failCounts[ip.String()] > 0 {
-		log.Printf("[HEALTH_POLLER] %s recovered after failures", ip)
+		log.Printf("[TCP_HEALTH_POLLER] %s recovered after failures", ip)
 	}
 	delete(p.failCounts, ip.String())
 }
 
-// computeLoadScore normalizes metrics into a unified 0-255 load score.
+// Normalizes metrics into a unified 0-255 load score
 func computeLoadScore(m BackendMetrics) uint32 {
-	cpuComponent := uint32(m.CPUPercent * 2.55)
-	memComponent := uint32(m.MemoryPercent * 2.55)
+	cpuComponent := float64(m.CPUPercent * 2.55)
+	memComponent := float64(m.MemoryPercent * 2.55)
 
-	score := (cpuComponent*60 + memComponent*20) / 100
-	if score > 255 {
-		score = 255
+	weighted := 0.65*cpuComponent + 0.35*memComponent
+	bottleneck := max(cpuComponent, memComponent)
+
+	load := max(weighted, bottleneck)
+
+	load_score := uint32(load)
+	if load_score > 255 {
+		load_score = 255
 	}
-	return score
+
+	return load_score
 }
