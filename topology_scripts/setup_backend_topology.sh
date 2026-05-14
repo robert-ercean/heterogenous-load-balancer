@@ -33,9 +33,24 @@ UDP_IPS=(
   "172.16.0.30"
 )
 
+TCP_WORKLOADS=(
+  "cpu"
+  "cpu"
+  "cpu"
+  "idle"
+  "idle"
+  "idle"
+  "idle"
+  "idle"
+  "cpu"
+  "idle"
+)
+
 # Where the agent binaries live on the host
-TCP_AGENT_BIN="/home/robert/Desktop/lb/backend_devices_scripts/tcp/tcp_register"
+TCP_AGENT_BIN="/home/robert/Desktop/lb/backend_devices_scripts/tcp/register/tcp_register"
 UDP_AGENT_BIN="/home/robert/Desktop/lb/backend_devices_scripts/udp/udp_register"
+TCP_CPU_WORK_BIN="/home/robert/Desktop/lb/backend_devices_scripts/tcp/cpu_work/tcp_cpu_work"
+
 
 if [ ! -x "$TCP_AGENT_BIN" ]; then
     echo "ERROR: $TCP_AGENT_BIN not found or not executable"
@@ -43,6 +58,10 @@ if [ ! -x "$TCP_AGENT_BIN" ]; then
 fi
 if [ ! -x "$UDP_AGENT_BIN" ]; then
     echo "ERROR: $UDP_AGENT_BIN not found or not executable"
+    exit 1
+fi
+if [ ! -x "$TCP_CPU_WORK_BIN" ]; then
+    echo "ERROR: $TCP_CPU_WORK_BIN not found or not executable"
     exit 1
 fi
 
@@ -86,15 +105,34 @@ echo "[4/5] Creating TCP backends..."
 
 for i in "${!TCP_IPS[@]}"; do
   n=$((i + 1))
+  ip="${TCP_IPS[$i]}"
+  workload="${TCP_WORKLOADS[$i]}"
+
+  case "$workload" in
+    cpu)
+      WORKER_CMD="/cpu_work --workers 1 --busy-percent 10 --period-ms 100"
+      ;;
+    idle)
+      WORKER_CMD="tail -f /dev/null"
+      ;;
+    *)
+      echo "ERROR: unknown TCP workload: $workload"
+      exit 1
+      ;;
+  esac
+
+  echo "      tcp-backend-$n ip=$ip workload=$workload"
 
   docker run -d \
     --name "tcp-backend-$n" \
     --network lb-backends \
-    --ip "${TCP_IPS[$i]}" \
-    --cpus 0.3 \
-    --memory 256m \
+    --ip "$ip" \
+    --cpus "0.3" \
+    --memory "256m" \
+    --memory-swap "256m" \
     -v "$TCP_AGENT_BIN:/agent:ro" \
-    alpine /agent --cp "$CP_HTTP_ADDR" --port 50051
+    -v "$TCP_CPU_WORK_BIN:/cpu_work:ro" \
+    alpine sh -c "/agent --cp '$CP_HTTP_ADDR' --port 50051 & exec $WORKER_CMD"
 done
 
 # ─── Step 5: UDP backends ──────────────────────────────────────

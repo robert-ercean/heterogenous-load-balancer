@@ -21,7 +21,7 @@ func New(reg *registry.Registry) *Pruner {
 }
 
 func (p *Pruner) Run() {
-	log.Printf("[HEARTBEAT_PRUNER] starting, loopInterval=%d(s) staleThreshold=%d(s)", loopIntervalSec, staleThresholdSec)
+	log.Printf("[HEARTBEAT_PRUNER] starting, loopInterval=%.0fs staleThreshold=%.0fs", loopIntervalSec.Seconds(), staleThresholdSec.Seconds())
 
 	ticker := time.NewTicker(loopIntervalSec)
 	defer ticker.Stop()
@@ -31,4 +31,3 @@ func (p *Pruner) Run() {
 		p.reg.RemoveStaleUDPBackend(cutoff)
 	}
 }
-
