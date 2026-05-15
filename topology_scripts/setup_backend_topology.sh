@@ -37,12 +37,12 @@ TCP_WORKLOADS=(
   "cpu"
   "cpu"
   "cpu"
-  "idle"
-  "idle"
-  "idle"
-  "idle"
-  "idle"
   "cpu"
+  "mem"
+  "mem"
+  "mem"
+  "mem"
+  "idle"
   "idle"
 )
 
@@ -50,6 +50,7 @@ TCP_WORKLOADS=(
 TCP_AGENT_BIN="/home/robert/Desktop/lb/backend_devices_scripts/tcp/register/tcp_register"
 UDP_AGENT_BIN="/home/robert/Desktop/lb/backend_devices_scripts/udp/udp_register"
 TCP_CPU_WORK_BIN="/home/robert/Desktop/lb/backend_devices_scripts/tcp/cpu_work/tcp_cpu_work"
+TCP_MEM_WORK_BIN="/home/robert/Desktop/lb/backend_devices_scripts/tcp/mem_work/tcp_mem_work"
 
 
 if [ ! -x "$TCP_AGENT_BIN" ]; then
@@ -71,13 +72,19 @@ CP_HTTP_ADDR="${BR_IP_NO_MASK}:9998"
 CP_UDP_ADDR="${BR_IP_NO_MASK}:9999"
 
 # ─── Step 1: Bridge ────────────────────────────────────────────
-echo "[1/5] Creating virtual bridge $BR_NAME..."
-ip link add name $BR_NAME type bridge 2>/dev/null \
-  || echo "      bridge already exists, skipping"
-ip link set $BR_NAME up
-ip addr add $BR_IP dev $BR_NAME 2>/dev/null \
-  || echo "      IP already assigned, skipping"
-echo "      br0 up at $BR_IP"
+# check if interface already exists before trying to create it, to avoid exiting
+if ip link show "$BR_NAME" > /dev/null 2>&1; then
+    echo "  Bridge $BR_NAME already exists, skipping creation"
+else
+    echo "  Creating bridge: $BR_NAME"
+    echo "[1/5] Creating virtual bridge $BR_NAME..."
+    ip link add name $BR_NAME type bridge 2>/dev/null \
+      || echo "      bridge already exists, skipping"
+    ip link set $BR_NAME up
+    ip addr add $BR_IP dev $BR_NAME 2>/dev/null \
+      || echo "      IP already assigned, skipping"
+    echo "      br0 up at $BR_IP"
+fi
 
 # ─── Step 2: IP forwarding ─────────────────────────────────────
 echo "[2/5] Enabling IP forwarding..."
@@ -115,6 +122,9 @@ for i in "${!TCP_IPS[@]}"; do
     idle)
       WORKER_CMD="tail -f /dev/null"
       ;;
+    mem)
+      WORKER_CMD="/mem_work --mb 160 --touch-interval-ms 1000"
+      ;;
     *)
       echo "ERROR: unknown TCP workload: $workload"
       exit 1
@@ -132,6 +142,7 @@ for i in "${!TCP_IPS[@]}"; do
     --memory-swap "256m" \
     -v "$TCP_AGENT_BIN:/agent:ro" \
     -v "$TCP_CPU_WORK_BIN:/cpu_work:ro" \
+    -v "$TCP_MEM_WORK_BIN:/mem_work:ro" \
     alpine sh -c "/agent --cp '$CP_HTTP_ADDR' --port 50051 & exec $WORKER_CMD"
 done
 
