@@ -146,20 +146,36 @@ func (p *Poller) recordSuccess(ip net.IP) {
 	delete(p.failCounts, ip.String())
 }
 
-// Normalizes metrics into a unified 0-255 load score
+// Normalizes metrics into a unified 0-255 load score.
+// The score uses dominant load: the most saturated resource
+// among CPU and memory: lower score = less loaded backend.
 func computeLoadScore(m BackendMetrics) uint32 {
-	cpuComponent := float64(m.CPUPercent * 2.55)
-	memComponent := float64(m.MemoryPercent * 2.55)
+	cpu := clampFloat(float64(m.CPUPercent), 0, 100)
+	mem := clampFloat(float64(m.MemoryPercent), 0, 100)
 
-	weighted := 0.65*cpuComponent + 0.35*memComponent
-	bottleneck := max(cpuComponent, memComponent)
+	dominant := maxFloat(cpu, mem)
 
-	load := max(weighted, bottleneck)
-
-	load_score := uint32(load)
-	if load_score > 255 {
-		load_score = 255
+	loadScore := uint32((dominant / 100.0) * 255.0)
+	if loadScore > 255 {
+		loadScore = 255
 	}
 
-	return load_score
+	return loadScore
+}
+
+func clampFloat(v, min, max float64) float64 {
+	if v < min {
+		return min
+	}
+	if v > max {
+		return max
+	}
+	return v
+}
+
+func maxFloat(a, b float64) float64 {
+	if a > b {
+		return a
+	}
+	return b
 }
