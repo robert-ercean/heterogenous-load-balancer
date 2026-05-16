@@ -8,6 +8,7 @@ import (
 	"syscall"
 	"time"
 
+	"lb/control-plane/bpfloader"
 	"lb/control-plane/healthpoller"
 	"lb/control-plane/heartbeatpruner"
 	"lb/control-plane/httplistener"
@@ -16,7 +17,9 @@ import (
 )
 
 const (
-	reportIntervalSec = 10 * time.Second
+	reportIntervalSec      = 10 * time.Second
+	backendFacingInterface = "br0"
+	VIPInterface           = "enp7s0"
 )
 
 func main() {
@@ -54,6 +57,21 @@ func main() {
 
 	// Print registry state every 10s for visibility
 	go reportLoop(reg)
+
+	loader, err := bpfloader.New()
+	if err != nil {
+		log.Fatalf("[MAIN] failed to initialize BPF loader: %v", err)
+	}
+	defer loader.Close()
+
+	// Attach XDP to the specified interface (e.g., "eth0")
+	if err := loader.AttachXDP(VIPInterface); err != nil {
+		log.Fatalf("[MAIN] failed to attach XDP hook: %v", err)
+	}
+
+	if err := loader.AttachTC(backendFacingInterface); err != nil {
+		log.Fatalf("[MAIN] failed to attach TC hook: %v", err)
+	}
 
 	// Block on shutdown signal
 	sig := make(chan os.Signal, 1)

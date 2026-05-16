@@ -1,3 +1,5 @@
+lib/control-plane/bpfloader/xdpforward*
+lib/control-plane/bpfloader/tcreturn*
 lib/control-plane/control-plane
 lib/control-plane/control_plane
 backend_devices_scripts
