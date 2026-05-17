@@ -56,7 +56,17 @@ func New() (*Loader, error) {
 		return nil, fmt.Errorf("[BPF_LOADER] load XDP objects: %w", err)
 	}
 
-	if err := loadTcreturnObjects(&l.tcObjs, nil); err != nil {
+	// We use the same underlying BPF maps in both XDP and TC programs, so we need to tell the TC loader to
+	// reuse the already loaded maps instead of trying to create new ones
+	tcOpts := &ebpf.CollectionOptions{
+		MapReplacements: map[string]*ebpf.Map{
+			"tcp_pool":  l.xdpObjs.TcpPool,
+			"udp_pool":  l.xdpObjs.UdpPool,
+			"pool_meta": l.xdpObjs.PoolMeta,
+			"vip_map":   l.xdpObjs.VipMap,
+		},
+	}
+	if err := loadTcreturnObjects(&l.tcObjs, tcOpts); err != nil {
 		l.xdpObjs.Close()
 		return nil, fmt.Errorf("[BPF_LOADER] load TC objects: %w", err)
 	}
@@ -126,6 +136,35 @@ func (l *Loader) SetVIP(vip net.IP) error {
 	}
 
 	log.Printf("[BPF_LOADER] VIP set to %s (raw u32: 0x%X)", vip, vipU32)
+	return nil
+}
+
+// SetLBBridgeIP writes the LB's bridge IP to the TC config map.
+// This is the IP that TC BPF will use to identify "control plane traffic"
+// and bypass for those packets.
+func (l *Loader) SetLBBridgeIP(ip net.IP) error {
+	ipv4 := ip.To4()
+	if ipv4 == nil {
+		return fmt.Errorf("not an IPv4 address: %s", ip)
+	}
+	val := binary.LittleEndian.Uint32(ipv4)
+	key := uint32(0)
+	if err := l.tcObjs.LbBridgeIp.Update(key, val, ebpf.UpdateAny); err != nil {
+		return fmt.Errorf("update lb_bridge_ip: %w", err)
+	}
+	log.Printf("[bpfloader] LB bridge IP set to %s", ip)
+	return nil
+}
+
+// SetVIPTCPPort writes the VIP's TCP port to the TC config map.
+// TC uses this to know what port to rewrite backend reply source ports back to.
+func (l *Loader) SetVIPTCPPort(port uint16) error {
+	val := uint32(port)
+	key := uint32(0)
+	if err := l.tcObjs.VipTcpPort.Update(key, val, ebpf.UpdateAny); err != nil {
+		return fmt.Errorf("update vip_tcp_port: %w", err)
+	}
+	log.Printf("[bpfloader] VIP TCP port set to %d", port)
 	return nil
 }
 

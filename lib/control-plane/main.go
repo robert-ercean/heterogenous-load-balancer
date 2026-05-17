@@ -24,6 +24,8 @@ const (
 	vipStr                 = "192.168.1.100"
 	UDPlistenPort          = ":9999"
 	HTTPlistenPort         = ":9998"
+	LBBridgeIP             = "172.16.0.1"
+	VIPTCPPort             = 5555
 )
 
 func main() {
@@ -36,13 +38,19 @@ func main() {
 	reg := registry.CreateRegistry()
 
 	loader, err := bpfloader.New()
-	if err != nil {
+	if err != nil { 
 		log.Fatalf("[MAIN] failed to initialize BPF loader: %v", err)
 	}
 	defer loader.Close()
 
 	if err := loader.SetVIP(net.ParseIP(vipStr)); err != nil {
 		log.Fatalf("[MAIN] set VIP: %v", err)
+	}
+	if err := loader.SetLBBridgeIP(net.ParseIP(LBBridgeIP)); err != nil {
+		log.Fatalf("[MAIN] set LB bridge IP: %v", err)
+	}
+	if err := loader.SetVIPTCPPort(VIPTCPPort); err != nil {
+		log.Fatalf("[MAIN] set VIP TCP port: %v", err)
 	}
 
 	// Attach XDP to the specified interface (e.g., "eth0")

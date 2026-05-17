@@ -103,18 +103,6 @@ int xdp_forward(struct xdp_md *ctx) {
         return XDP_PASS;
     }
 
-    // ─── NEW: read VIP and log comparison ─────────────────
-    __u32 key = 0;
-    __u32 *vip_ptr = bpf_map_lookup_elem(&vip_map, &key);
-    if (vip_ptr) {
-        // Log the daddr we see vs the VIP we have configured.
-        // Both are in network byte order (raw __be32 representations).
-        bpf_printk("XDP packet: daddr=0x%x  vip_in_map=0x%x",
-                   ip->daddr, *vip_ptr);
-    } else {
-        bpf_printk("XDP packet: vip_map empty");
-    }
-
     // Existing protocol counting logic
     if (ip->protocol == IPPROTO_TCP) {
         inc_counter(CNT_TCP);
@@ -124,6 +112,8 @@ int xdp_forward(struct xdp_md *ctx) {
         inc_counter(CNT_OTHER);
     }
 
+    // ─── ACTUAL FORWARDING LOGIC ──────────────────────────────────
+
     // log pool sizes
     __u32 tcp_idx = 0, udp_idx = 1;
     __u32 *tcp_active = bpf_map_lookup_elem(&pool_meta, &tcp_idx);
@@ -132,28 +122,108 @@ int xdp_forward(struct xdp_md *ctx) {
     __u32 tcp_count = tcp_active ? *tcp_active : 0;
     __u32 udp_count = udp_active ? *udp_active : 0;
 
-    bpf_printk("XDP pool sizes: tcp=%u udp=%u", tcp_count, udp_count);
-
-    #pragma unroll
-    for (__u32 i = 0; i < 2; i++) {
-        if (i >= tcp_count) break;
-        __u32 slot = i;
-        struct backend_entry *entry = bpf_map_lookup_elem(&tcp_pool, &slot);
-        if (entry) {
-            __u32 host_ip = bpf_ntohl(entry->ip);
-            bpf_printk("ip=%u.%u.%u.%u, port=%u, load=%u",
-                (host_ip >> 24) & 0xff,
-                (host_ip >> 16) & 0xff,
-                (host_ip >> 8) & 0xff,
-                host_ip & 0xff,
-                bpf_ntohs(entry->port),
-                entry->load_score
-            );
-
-        }
+    // Only forward IPv4 TCP/UDP. For other protocols, pass to kernel.
+    if (ip->protocol != IPPROTO_TCP && ip->protocol != IPPROTO_UDP) {
+        return XDP_PASS;
     }
 
-    return XDP_PASS;
+    // Check VIP match. If not destined for our VIP, kernel handles it normally.
+    __u32 vip_key = 0;
+    __u32 *vip_ptr = bpf_map_lookup_elem(&vip_map, &vip_key);
+    if (!vip_ptr || ip->daddr != *vip_ptr) {
+        return XDP_PASS;
+    }
+
+    // Look up backend in slot 0 of the TCP pool.
+    // (UDP support added later; for now we only handle TCP packets to the VIP.)
+    if (ip->protocol != IPPROTO_TCP) {
+        return XDP_PASS;
+    }
+    if (!tcp_active || *tcp_active == 0) {
+        // No backends registered yet — pass through (client will get RST from kernel)
+        bpf_printk("XDP: no active backends in TCP pool, passing to kernel");
+        return XDP_PASS;
+    }
+
+    __u32 slot = 0;
+    struct backend_entry *backend = bpf_map_lookup_elem(&tcp_pool, &slot);
+    if (!backend) {
+        return XDP_PASS;
+    }
+
+    // Parse TCP header for the port we need to rewrite.
+    __u32 ip_hdr_len = ip->ihl * 4;
+    struct tcphdr *tcp = (struct tcphdr *)((void *)ip + ip_hdr_len);
+    if ((void *)(tcp + 1) > data_end) {
+        bpf_printk("XDP: packet too short for TCP header, passing to kernel");
+        return XDP_PASS;
+    }
+
+    // Save old values for checksum update
+    __be32 old_daddr = ip->daddr;
+    __be16 old_dport = tcp->dest;
+
+    // Rewrite L3 destination IP
+    ip->daddr = backend->ip;
+
+    // Rewrite L4 destination port
+    tcp->dest = backend->port;
+
+    // Update IP checksum (incremental, RFC 1624)
+    // Only the destination IP changed, so we update with that diff.
+    __u32 ip_csum_sum = (__u16)~ip->check;
+    ip_csum_sum += (__u16)~(old_daddr & 0xFFFF);
+    ip_csum_sum += (__u16)~((old_daddr >> 16) & 0xFFFF);
+    ip_csum_sum += (__u16)(backend->ip & 0xFFFF);
+    ip_csum_sum += (__u16)((backend->ip >> 16) & 0xFFFF);
+    while (ip_csum_sum >> 16) {
+        ip_csum_sum = (ip_csum_sum & 0xFFFF) + (ip_csum_sum >> 16);
+    }
+    ip->check = (__u16)~ip_csum_sum;
+
+    // Update TCP checksum (incremental)
+    // The TCP checksum covers the pseudo-header which includes the dst IP,
+    // AND the TCP header itself which includes the dst port. Both changed.
+    __u32 tcp_csum_sum = (__u16)~tcp->check;
+    // Diff for IP change
+    tcp_csum_sum += (__u16)~(old_daddr & 0xFFFF);
+    tcp_csum_sum += (__u16)~((old_daddr >> 16) & 0xFFFF);
+    tcp_csum_sum += (__u16)(backend->ip & 0xFFFF);
+    tcp_csum_sum += (__u16)((backend->ip >> 16) & 0xFFFF);
+    // Diff for port change
+    tcp_csum_sum += (__u16)~old_dport;
+    tcp_csum_sum += (__u16)backend->port;
+    while (tcp_csum_sum >> 16) {
+        tcp_csum_sum = (tcp_csum_sum & 0xFFFF) + (tcp_csum_sum >> 16);
+    }
+    tcp->check = (__u16)~tcp_csum_sum;
+
+    // Now figure out which interface to send out. The packet is now destined
+    // for the backend's IP, which lives on br0 (the bridge). Ask the kernel
+    // via bpf_fib_lookup which interface to use and what MACs to put on the frame.
+    struct bpf_fib_lookup fib = {};
+    fib.family = 2;  // AF_INET
+    fib.l4_protocol = ip->protocol;
+    fib.tot_len = bpf_ntohs(ip->tot_len);
+    fib.ipv4_src = ip->saddr;
+    fib.ipv4_dst = ip->daddr;
+    fib.ifindex = ctx->ingress_ifindex;
+
+    int fib_ret = bpf_fib_lookup(ctx, &fib, sizeof(fib), 0);
+    if (fib_ret != BPF_FIB_LKUP_RET_SUCCESS) {
+        // Couldn't resolve next hop. Could be no route, no ARP entry, etc.
+        // For now, pass to kernel and let it figure things out.
+        bpf_printk("XDP fib_lookup failed: ret=%d", fib_ret);
+        return XDP_PASS;
+    }
+
+    // Rewrite Ethernet MACs to the ones the FIB resolution returned.
+    __builtin_memcpy(eth->h_source, fib.smac, 6);
+    __builtin_memcpy(eth->h_dest, fib.dmac, 6);
+
+    // Redirect to the egress interface returned by FIB.
+    return bpf_redirect(fib.ifindex, 0);
+
 }
 
 char _license[] SEC("license") = "GPL";
