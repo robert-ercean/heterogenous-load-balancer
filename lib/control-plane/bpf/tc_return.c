@@ -112,13 +112,13 @@ int tc_return(struct __sk_buff *skb) {
         return TC_ACT_OK;
     }
 
-    // CRITICAL: if destination is the LB's bridge IP, this is control plane
+    // If destination is the LB's bridge IP, this is control plane
     // traffic (heartbeats, health responses). Pass through unchanged.
     __u32 key = 0;
     __u32 *bridge_ip = bpf_map_lookup_elem(&lb_bridge_ip, &key);
     if (bridge_ip && ip->daddr == *bridge_ip) {
         inc_counter(TCNT_TO_LB);
-        return TC_ACT_OK;
+        return TC_ACT_OK;   
     }
 
     // Only handle TCP for now
@@ -165,36 +165,25 @@ int tc_return(struct __sk_buff *skb) {
     __be32 old_saddr = ip->saddr;
     __be16 old_sport = tcp->source;
 
+    __u8 proto = ip->protocol;
+    __u16 total_len = bpf_ntohs(ip->tot_len);
+    __be32 dst_addr = ip->daddr;
+
     // Rewrite
+    // Calculate the exact byte offsets from the start of the packet
+    __u32 ip_csum_offset = sizeof(struct ethhdr) + offsetof(struct iphdr, check);
+    __u32 tcp_csum_offset = sizeof(struct ethhdr) + ip_hdr_len + offsetof(struct tcphdr, check);
+
     ip->saddr = new_saddr;
-    // printk the new saddr and the sport for debugging: 
     tcp->source = new_sport;
-    bpf_printk("TC: rewriting TCP packet from %pI4:%d to %pI4:%d",
-               &old_saddr, bpf_ntohs(old_sport), &new_saddr, bpf_ntohs(new_sport));
 
-    // Update IP checksum (incremental, src IP changed)
-    __u32 ip_csum_sum = (__u16)~ip->check;
-    ip_csum_sum += (__u16)~(old_saddr & 0xFFFF);
-    ip_csum_sum += (__u16)~((old_saddr >> 16) & 0xFFFF);
-    ip_csum_sum += (__u16)(new_saddr & 0xFFFF);
-    ip_csum_sum += (__u16)((new_saddr >> 16) & 0xFFFF);
-    while (ip_csum_sum >> 16) {
-        ip_csum_sum = (ip_csum_sum & 0xFFFF) + (ip_csum_sum >> 16);
-    }
-    ip->check = (__u16)~ip_csum_sum;
+    //  Update TCP Checksum (Must use BPF_F_PSEUDO_HDR flag when IP changes)
+    // We pass sizeof() so the kernel knows whether we are updating a 32-bit IP or 16-bit port
+    bpf_l4_csum_replace(skb, tcp_csum_offset, old_saddr, new_saddr, BPF_F_PSEUDO_HDR | sizeof(new_saddr));
+    bpf_l4_csum_replace(skb, tcp_csum_offset, old_sport, new_sport, sizeof(new_sport));
 
-    // Update TCP checksum (src IP changed, src port changed)
-    __u32 tcp_csum_sum = (__u16)~tcp->check;
-    tcp_csum_sum += (__u16)~(old_saddr & 0xFFFF);
-    tcp_csum_sum += (__u16)~((old_saddr >> 16) & 0xFFFF);
-    tcp_csum_sum += (__u16)(new_saddr & 0xFFFF);
-    tcp_csum_sum += (__u16)((new_saddr >> 16) & 0xFFFF);
-    tcp_csum_sum += (__u16)~old_sport;
-    tcp_csum_sum += (__u16)new_sport;
-    while (tcp_csum_sum >> 16) {
-        tcp_csum_sum = (tcp_csum_sum & 0xFFFF) + (tcp_csum_sum >> 16);
-    }
-    tcp->check = (__u16)~tcp_csum_sum;
+    //  Update IP Checksum
+    bpf_l3_csum_replace(skb, ip_csum_offset, old_saddr, new_saddr, sizeof(new_saddr));
 
     inc_counter(TCNT_TCP_REWRITTEN);
 
@@ -204,11 +193,11 @@ int tc_return(struct __sk_buff *skb) {
     // would forward the frame with the bridge MAC, which the client wouldn't accept.
     // bpf_fib_lookup gives us src and dst MAC for the egress path.
     struct bpf_fib_lookup fib = {};
-    fib.family = 2;  // AF_INET
-    fib.l4_protocol = ip->protocol;
-    fib.tot_len = bpf_ntohs(ip->tot_len);
-    fib.ipv4_src = ip->saddr;
-    fib.ipv4_dst = ip->daddr;
+    fib.family = 2; // AF_INET
+    fib.l4_protocol = proto;
+    fib.tot_len = total_len;
+    fib.ipv4_src = new_saddr;
+    fib.ipv4_dst = dst_addr;
     fib.ifindex = ENP7S0_IFINDEX;
 
     int fib_ret = bpf_fib_lookup(skb, &fib, sizeof(fib), 0);
