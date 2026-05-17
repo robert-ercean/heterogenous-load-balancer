@@ -1,0 +1,1 @@
+cd bpfloader && go generate && cd .. && go build -o control_plane && sudo ./control_plane

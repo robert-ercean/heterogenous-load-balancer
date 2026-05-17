@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"log"
+	"net"
 	"os"
 	"os/signal"
 	"syscall"
@@ -20,6 +21,9 @@ const (
 	reportIntervalSec      = 10 * time.Second
 	backendFacingInterface = "br0"
 	VIPInterface           = "enp7s0"
+	vipStr                 = "192.168.1.100"
+	UDPlistenPort          = ":9999"
+	HTTPlistenPort         = ":9998"
 )
 
 func main() {
@@ -30,8 +34,41 @@ func main() {
 	log.Println("[MAIN] starting control plane")
 
 	reg := registry.CreateRegistry()
-	UDPlistenPort := ":9999"
-	HTTPlistenPort := ":9998"
+
+	loader, err := bpfloader.New()
+	if err != nil {
+		log.Fatalf("[MAIN] failed to initialize BPF loader: %v", err)
+	}
+	defer loader.Close()
+
+	if err := loader.SetVIP(net.ParseIP(vipStr)); err != nil {
+		log.Fatalf("[MAIN] set VIP: %v", err)
+	}
+
+	// Attach XDP to the specified interface (e.g., "eth0")
+	if err := loader.AttachXDP(VIPInterface); err != nil {
+		log.Fatalf("[MAIN] failed to attach XDP hook: %v", err)
+	}
+
+	if err := loader.AttachTC(backendFacingInterface); err != nil {
+		log.Fatalf("[MAIN] failed to attach TC hook: %v", err)
+	}
+
+	reg.OnRegister(func(b registry.BackendEntry) {
+		var pool bpfloader.Pool
+		switch b.Pool {
+		case registry.PoolTCP:
+			pool = bpfloader.PoolTCP
+		case registry.PoolUDP:
+			pool = bpfloader.PoolUDP
+		default:
+			log.Printf("[MAIN] unknown pool %v for backend %s", b.Pool, b.IP)
+			return
+		}
+		if err := loader.SetBackend(pool, b.IP, b.Port, b.LoadScore); err != nil {
+			log.Printf("[MAIN] failed to set backend in BPF map: %v", err)
+		}
+	})
 
 	// Start UDP listener for UDP backends
 	go func() {
@@ -57,21 +94,6 @@ func main() {
 
 	// Print registry state every 10s for visibility
 	go reportLoop(reg)
-
-	loader, err := bpfloader.New()
-	if err != nil {
-		log.Fatalf("[MAIN] failed to initialize BPF loader: %v", err)
-	}
-	defer loader.Close()
-
-	// Attach XDP to the specified interface (e.g., "eth0")
-	if err := loader.AttachXDP(VIPInterface); err != nil {
-		log.Fatalf("[MAIN] failed to attach XDP hook: %v", err)
-	}
-
-	if err := loader.AttachTC(backendFacingInterface); err != nil {
-		log.Fatalf("[MAIN] failed to attach TC hook: %v", err)
-	}
 
 	// Block on shutdown signal
 	sig := make(chan os.Signal, 1)

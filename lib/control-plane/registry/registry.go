@@ -13,6 +13,7 @@ import (
 type Registry struct {
 	mu       sync.RWMutex
 	backends map[string]*BackendEntry // keyed by IP str
+	onRegister []func(BackendEntry) // callback for when a backend is registered
 }
 
 func CreateRegistry() *Registry {
@@ -21,29 +22,48 @@ func CreateRegistry() *Registry {
 	}
 }
 
+// OnRegister installs a callback executed once for each new backend registration,
+// for both TCP and UDP pools. The callback receives a copy of the BackendEntry.
+// Callbacks are invoked without the registry lock held.
+func (r *Registry) OnRegister(fn func(BackendEntry)) {
+    r.mu.Lock()
+    defer r.mu.Unlock()
+    r.onRegister = append(r.onRegister, fn)
+}
+
 func (r *Registry) RegisterBackendEntry(pool Pool, ip net.IP, port uint16) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
+    r.mu.Lock()
 
-	key := ip.String()
-	current_time := time.Now()
+    key := ip.String()
+    current_time := time.Now()
+    if _, ok := r.backends[key]; ok {
+        log.Printf("[REGISTRY] Device tried to register, but already exists: %s:%d (%s)", ip, port, pool)
+        r.mu.Unlock()
+        return
+    }
 
-	if _, ok := r.backends[key]; ok {
-		log.Printf("REGISTRY] Device tried to register, but already exists: %s:%d (%s)", ip, port, pool)
-		return
-	}
+    b := &BackendEntry{
+        Pool:       pool,
+        IP:         ip,
+        Port:       port,
+        LoadScore:  1,
+        LastSeen:   current_time,
+        Registered: current_time,
+    }
+    r.backends[key] = b
+    log.Printf("[REGISTRY] Registered device: %s:%d (%s)", ip, port, pool)
 
-	b := &BackendEntry{
-		Pool:       pool,
-		IP:         ip,
-		Port:       port,
-		LoadScore:  1,
-		LastSeen:   current_time,
-		Registered: current_time,
-	}
-	r.backends[key] = b
+    // Snapshot hooks and copy the entry while holding the lock
+    hooks := make([]func(BackendEntry), len(r.onRegister))
+    copy(hooks, r.onRegister)
+    entryCopy := *b
 
-	log.Printf("[REGISTRY] Registered device: %s:%d (%s)", ip, port, pool)
+    r.mu.Unlock()
+
+    // Start hooks without the lock held
+    for _, fn := range hooks {
+        fn(entryCopy)
+    }
 }
 
 // UpdateLoadScore sets the load score and refreshes LastSeen for the backend
