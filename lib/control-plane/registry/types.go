@@ -30,4 +30,5 @@ type BackendEntry struct {
 	LoadScore  uint32    // normalized load, updated by health checks
 	LastSeen   time.Time // timestamp of last heartbeat
 	Registered time.Time // timestamp of registration
+	Mac        net.HardwareAddr
 }

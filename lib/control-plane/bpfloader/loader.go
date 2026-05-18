@@ -34,9 +34,10 @@ type Loader struct {
 type BackendEntryBPF struct {
 	IP        uint32 // network byte order in memory
 	Port      uint16 // network byte order in memory
-	Pad       uint16
+	Pad1      uint16
 	LoadScore uint32
-	Pad2      uint32
+	Mac       [6]byte
+	Pad2      uint16
 }
 
 type Pool uint32
@@ -183,7 +184,7 @@ func (l *Loader) SetVIPTCPPort(port uint16) error {
 //
 // For now we only support adding (no removal, no slot reuse).
 // We'll add proper slot management when we integrate with the registry's full lifecycle.
-func (l *Loader) SetBackend(pool Pool, ip net.IP, port uint16, loadScore uint32) error {
+func (l *Loader) SetBackend(pool Pool, ip net.IP, port uint16, loadScore uint32, mac net.HardwareAddr) error {
 	ipv4 := ip.To4()
 	if ipv4 == nil {
 		return fmt.Errorf("[BPF_LOADER] not an IPv4 address: %s", ip)
@@ -193,6 +194,7 @@ func (l *Loader) SetBackend(pool Pool, ip net.IP, port uint16, loadScore uint32)
 		IP:        binary.LittleEndian.Uint32(ipv4),
 		Port:      htons(port),
 		LoadScore: loadScore,
+		Mac:       [6]byte{mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]},
 	}
 
 	// Pick the right pool map and the right meta slot

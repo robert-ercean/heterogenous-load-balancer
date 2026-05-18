@@ -41,7 +41,7 @@ func (r *Registry) OnLoadScoreUpdate(fn func(BackendEntry)) {
 	r.onLoadScoreUpdate = append(r.onLoadScoreUpdate, fn)
 }
 
-func (r *Registry) RegisterBackendEntry(pool Pool, ip net.IP, port uint16) {
+func (r *Registry) RegisterBackendEntry(pool Pool, ip net.IP, port uint16, mac net.HardwareAddr) {
 	r.mu.Lock()
 
 	key := ip.String()
@@ -59,6 +59,7 @@ func (r *Registry) RegisterBackendEntry(pool Pool, ip net.IP, port uint16) {
 		LoadScore:  1,
 		LastSeen:   current_time,
 		Registered: current_time,
+		Mac:        mac,
 	}
 	r.backends[key] = b
 	log.Printf("[REGISTRY] Registered device: %s:%d (%s)", ip, port, pool)

@@ -19,13 +19,15 @@
 #define TCNT_MAX                8
 
 #define ENP7S0_IFINDEX 2
+__u8 enp7s0_mac[6] = {0x8c, 0x8c, 0xaa, 0xff, 0xdb, 0x3d};
 
 struct backend_entry {
-    __u32 ip;
-    __u16 port;
-    __u16 _pad;
+    __u32 ip;           // network byte order
+    __u16 port;         // network byte order
+    __u16 pad1;
     __u32 load_score;
-    __u32 _pad2;
+    __u8  mac[6];
+    __u16 pad2;
 };
 
 struct flow_key {
@@ -238,7 +240,7 @@ int tc_return(struct __sk_buff *skb) {
     if ((void *)(eth_out + 1) > eth_end) {
         return TC_ACT_OK;
     }
-    __builtin_memcpy(eth_out->h_source, fib.smac, 6);
+    __builtin_memcpy(eth_out->h_source, enp7s0_mac, 6);
     __builtin_memcpy(eth_out->h_dest, fib.dmac, 6);
 
     bpf_printk("TC: redirecting to enp7s0 (ifindex=%d), dst_mac %x:%x:%x:%x:%x:%x",

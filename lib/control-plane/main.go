@@ -73,7 +73,7 @@ func main() {
 			log.Printf("[MAIN] unknown pool %v for backend %s", b.Pool, b.IP)
 			return
 		}
-		if err := loader.SetBackend(pool, b.IP, b.Port, b.LoadScore); err != nil {
+		if err := loader.SetBackend(pool, b.IP, b.Port, b.LoadScore, b.Mac); err != nil {
 			log.Printf("[MAIN] failed to set backend in BPF map: %v", err)
 		}
 	})

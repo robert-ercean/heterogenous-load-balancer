@@ -22,14 +22,18 @@
 #define CNT_CT_INSERT_FAIL   12
 #define CNT_MAX              13
 
+__u8 egress_mac[6] = {0xba, 0xc6, 0xbe, 0x41, 0x58, 0xd9};
+#define EGRESS_IFINDEX 4
+
 // -------- Data structures --------
 
 struct backend_entry {
     __u32 ip;           // network byte order
     __u16 port;         // network byte order
-    __u16 _pad;
+    __u16 pad1;
     __u32 load_score;
-    __u32 _pad2;
+    __u8  mac[6];
+    __u16 pad2;
 };
 
 // 5-tuple key for conntrack maps.
@@ -40,7 +44,6 @@ struct flow_key {
     __u16 src_port;
     __u16 dst_port;
     __u8  proto;
-    __u8  _pad[3];   // align to 16 bytes
 };
 
 // Conntrack value: which backend slot serves this flow.
@@ -294,28 +297,13 @@ int xdp_forward(struct xdp_md *ctx) {
     tcp->check = csum_replace_u32(tcp->check, old_daddr, backend->ip);
     tcp->check = csum_replace_u16(tcp->check, old_dport, backend->port);
 
-    // Resolve next hop and redirect
-    struct bpf_fib_lookup fib = {};
-    fib.family = 2;
-    fib.l4_protocol = ip->protocol;
-    fib.tot_len = bpf_ntohs(ip->tot_len);
-    fib.ipv4_src = ip->saddr;
-    fib.ipv4_dst = ip->daddr;
-    fib.ifindex = ctx->ingress_ifindex;
-
-    int fib_ret = bpf_fib_lookup(ctx, &fib, sizeof(fib), 0);
-    if (fib_ret != BPF_FIB_LKUP_RET_SUCCESS) {
-        bpf_printk("XDP: FIB lookup failed for backend IP, letting the kernel handle it: ret=%d", fib_ret);
-        inc_counter(CNT_FIB_FAILED);
-        return XDP_PASS;
-    }
-
-    __builtin_memcpy(eth->h_source, fib.smac, 6);
-    __builtin_memcpy(eth->h_dest, fib.dmac, 6);
+    // Rewrite Ethernet destination to backend MAC
+    __builtin_memcpy(eth->h_source, egress_mac, 6);
+    __builtin_memcpy(eth->h_dest, backend->mac, 6);
 
     inc_counter(CNT_VIP_TCP_FORWARDED);
     bpf_printk("XDP: forwarding packet to backend slot %d at IP %x, port %d", slot, backend->ip, bpf_ntohs(backend->port));
-    return bpf_redirect(fib.ifindex, 0);
+    return bpf_redirect(EGRESS_IFINDEX, 0);
 }
 
 char _license[] SEC("license") = "GPL";

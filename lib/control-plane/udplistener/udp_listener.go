@@ -50,7 +50,7 @@ func handlePacket(conn *net.UDPConn, reg *registry.Registry, src *net.UDPAddr, p
 	case MsgRegister:
 		msg := payload.(RegisterMsg)
 
-		reg.RegisterBackendEntry(registry.PoolUDP, src.IP, msg.Port)
+		reg.RegisterBackendEntry(registry.PoolUDP, src.IP, msg.Port, net.HardwareAddr{})
 
 		ack := EncodeAck()
 		if _, err := conn.WriteToUDP(ack, src); err != nil {
