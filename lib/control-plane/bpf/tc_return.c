@@ -169,13 +169,15 @@ int tc_return(struct __sk_buff *skb) {
 
     struct ct_value *ct = bpf_map_lookup_elem(&tcp_conntrack_reverse, &rev_key);
     if (!ct) {
-        // No conntrack — this packet isn't part of a flow we manage.
-        // Could be: a backend talking to something else, or a stale packet.
+        // No conntrack - this packet isn't part of a flow we manage.
+        bpf_printk("TC: conntrack miss for flow %x:%d -> %x:%d\n",
+                   rev_key.src_ip, bpf_ntohs(rev_key.src_port),
+                   rev_key.dst_ip, bpf_ntohs(rev_key.dst_port));
         inc_counter(TCNT_CT_MISS);
         return TC_ACT_OK;
     }
 
-    // Found in conntrack — rewrite source to VIP
+    // Found in conntrack - rewrite source to VIP
     __u32 *vip_ptr = bpf_map_lookup_elem(&vip_map, &key);
     __u32 *vip_port_ptr = bpf_map_lookup_elem(&vip_tcp_port, &key);
     if (!vip_ptr || !vip_port_ptr) {

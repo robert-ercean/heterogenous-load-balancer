@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"sync"
 
 	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/link"
@@ -20,6 +21,12 @@ type Loader struct {
 
 	xdpLink link.Link
 	tcLink  link.Link
+
+	// slotMap maps backend IP → BPF map slot for fast load score updates.
+	// Protected by slotMu since SetBackend and UpdateBackendLoadScore
+	// can run from different goroutines.
+	slotMu  sync.Mutex
+	slotMap map[string]uint32
 }
 
 // BackendEntry mirrors "struct backend_entry" in xdp_forward.c.
@@ -27,9 +34,9 @@ type Loader struct {
 type BackendEntryBPF struct {
 	IP        uint32 // network byte order in memory
 	Port      uint16 // network byte order in memory
-	_Pad      uint16
+	Pad       uint16
 	LoadScore uint32
-	_Pad2     uint32
+	Pad2      uint32
 }
 
 type Pool uint32
@@ -50,7 +57,9 @@ func New() (*Loader, error) {
 		return nil, fmt.Errorf("[BPF_LOADER] remove memlock: %w", err)
 	}
 
-	l := &Loader{}
+	l := &Loader{
+		slotMap: make(map[string]uint32),
+	}
 
 	if err := loadXdpforwardObjects(&l.xdpObjs, nil); err != nil {
 		return nil, fmt.Errorf("[BPF_LOADER] load XDP objects: %w", err)
@@ -222,8 +231,62 @@ func (l *Loader) SetBackend(pool Pool, ip net.IP, port uint16, loadScore uint32)
 		return fmt.Errorf("[BPF_LOADER] update pool_meta[%s]: %w", poolName, err)
 	}
 
+	// Record the slot(currentCount) for later load score updates
+	l.slotMu.Lock()
+	// keyed by "poolName:ip" to distinguish TCP vs UDP backends with the same IP
+	l.slotMap[fmt.Sprintf("%s:%s", poolName, ip.String())] = slot
+	l.slotMu.Unlock()
+
 	log.Printf("[BPF_LOADER] %s backend added at slot %d: %s:%d (active count now %d)",
 		poolName, slot, ip, port, newCount)
+
+	return nil
+}
+
+// UpdateBackendLoadScore writes a new load score into the BPF pool entry
+// for the backend at the given IP. The slot is looked up via the slot map
+// populated by SetBackend.
+//
+// Returns an error if the backend isn't registered or the BPF update fails.
+func (l *Loader) UpdateBackendLoadScore(pool Pool, ip net.IP, loadScore uint32) error {
+	var poolMap *ebpf.Map
+	var poolName string
+
+	switch pool {
+	case PoolTCP:
+		poolMap = l.xdpObjs.TcpPool
+		poolName = "tcp"
+	case PoolUDP:
+		poolMap = l.xdpObjs.UdpPool
+		poolName = "udp"
+	default:
+		return fmt.Errorf("[BPF_LOADER] unknown pool: %d", pool)
+	}
+
+	// Look up slot for this backend
+	key := fmt.Sprintf("%s:%s", poolName, ip.String())
+	l.slotMu.Lock()
+	slot, ok := l.slotMap[key]
+	l.slotMu.Unlock()
+
+	if !ok {
+		return fmt.Errorf("[BPF_LOADER] no slot recorded for %s", key)
+	}
+
+	// Read current entry, update load_score, write back.
+	// Concurrency with SetBackend is fine because BPF map updates
+	// are per-entry atomic and we're only changing the load_score field
+	var entry BackendEntryBPF
+	if err := poolMap.Lookup(slot, &entry); err != nil {
+		return fmt.Errorf("[BPF_LOADER] lookup %s_pool[%d]: %w", poolName, slot, err)
+	}
+
+	entry.LoadScore = loadScore
+
+	if err := poolMap.Update(slot, entry, ebpf.UpdateAny); err != nil {
+		return fmt.Errorf("[BPF_LOADER] update %s_pool[%d]: %w", poolName, slot, err)
+	}
+
 	return nil
 }
 

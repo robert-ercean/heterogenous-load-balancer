@@ -8,11 +8,6 @@ BR_IP="172.16.0.1/24"
 BR_IP_NO_MASK="172.16.0.1"
 
 TCP_IPS=(
-  "172.16.0.11"
-)
-
-: '
-TCP_IPS=(
   "172.16.0.10"
   "172.16.0.11"
   "172.16.0.12"
@@ -25,6 +20,7 @@ TCP_IPS=(
   "172.16.0.19"
 )
 
+: '
 UDP_IPS=(
   "172.16.0.21"
   "172.16.0.22"
@@ -40,6 +36,15 @@ UDP_IPS=(
 
 '
 TCP_WORKLOADS=(
+  "idle"
+  "idle"
+  "idle"
+  "idle"
+  "idle"
+  "idle"
+  "idle"
+  "idle"
+  "idle"
   "idle"
 )
 
@@ -132,9 +137,10 @@ for i in "${!TCP_IPS[@]}"; do
 
   docker run -d \
     --name "tcp-backend-$n" \
+    --hostname "tcp-backend-$n" \
     --network lb-backends \
     --ip "$ip" \
-    --cpus "0.3" \
+    --cpus "0.5" \
     --memory "256m" \
     --memory-swap "256m" \
     -v "$TCP_AGENT_BIN:/agent:ro" \

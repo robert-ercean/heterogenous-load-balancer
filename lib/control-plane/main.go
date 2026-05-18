@@ -38,7 +38,7 @@ func main() {
 	reg := registry.CreateRegistry()
 
 	loader, err := bpfloader.New()
-	if err != nil { 
+	if err != nil {
 		log.Fatalf("[MAIN] failed to initialize BPF loader: %v", err)
 	}
 	defer loader.Close()
@@ -75,6 +75,22 @@ func main() {
 		}
 		if err := loader.SetBackend(pool, b.IP, b.Port, b.LoadScore); err != nil {
 			log.Printf("[MAIN] failed to set backend in BPF map: %v", err)
+		}
+	})
+
+	reg.OnLoadScoreUpdate(func(b registry.BackendEntry) {
+		var pool bpfloader.Pool
+		switch b.Pool {
+		case registry.PoolTCP:
+			pool = bpfloader.PoolTCP
+		case registry.PoolUDP:
+			pool = bpfloader.PoolUDP
+		default:
+			log.Printf("[MAIN] unknown pool %v for backend %s", b.Pool, b.IP)
+			return
+		}
+		if err := loader.UpdateBackendLoadScore(pool, b.IP, b.LoadScore); err != nil {
+			log.Printf("[MAIN] failed to update load score in BPF: %v", err)
 		}
 	})
 

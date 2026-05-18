@@ -200,7 +200,7 @@ int xdp_forward(struct xdp_md *ctx) {
     struct ct_value *ct = bpf_map_lookup_elem(&tcp_conntrack_forward, &fwd_key);
 
     if (ct) {
-        // Existing flow — use stored backend
+        // Existing flow - use stored backend
         slot = ct->backend_slot;
         inc_counter(CNT_CT_HIT);
         bpf_printk("XDP: conntrack hit for existing flow, backend slot=%d", slot);
@@ -217,7 +217,7 @@ int xdp_forward(struct xdp_md *ctx) {
             return XDP_DROP;
         }
 
-        // New flow - SYN present. Pick a backend (slot 0 hardcoded for now).
+        // New flow - SYN present. Pick a backend using the power of two choice principle
         bpf_printk("XDP: conntrack miss for new flow(got SYN), creating new entry in slot 0 (hardcoded)");
         // Sanity check if there are any active backends in the pool
         __u32 tcp_idx = 0;
@@ -228,12 +228,23 @@ int xdp_forward(struct xdp_md *ctx) {
             return XDP_PASS;
         }
 
-        slot = 0;
-        // Need backend info to build the reverse conntrack key
+        __u32 active_count = *active;
+        __u32 pick1 = bpf_get_prandom_u32() % active_count;
+        __u32 pick2 = bpf_get_prandom_u32() % active_count;
+        struct backend_entry *be1 = bpf_map_lookup_elem(&tcp_pool, &pick1);
+        struct backend_entry *be2 = bpf_map_lookup_elem(&tcp_pool, &pick2);
+        if (!be1 || !be2) {
+            inc_counter(CNT_NO_BACKEND);
+            bpf_printk("XDP: no active backends found at random picks, letting kernel handle it");
+            return XDP_PASS;
+        }
+        
+        slot = (be1->load_score <= be2->load_score) ? pick1 : pick2;
+        
         struct backend_entry *backend = bpf_map_lookup_elem(&tcp_pool, &slot);
         if (!backend) {
-            bpf_printk("XDP: slot 0(hardcoded) had no active backend in the TCP pool, dropping packet");
             inc_counter(CNT_NO_BACKEND);
+            bpf_printk("XDP: no backend found at selected slot %d, letting kernel handle it", slot);
             return XDP_PASS;
         }
 
@@ -303,6 +314,7 @@ int xdp_forward(struct xdp_md *ctx) {
     __builtin_memcpy(eth->h_dest, fib.dmac, 6);
 
     inc_counter(CNT_VIP_TCP_FORWARDED);
+    bpf_printk("XDP: forwarding packet to backend slot %d at IP %x, port %d", slot, backend->ip, bpf_ntohs(backend->port));
     return bpf_redirect(fib.ifindex, 0);
 }
 

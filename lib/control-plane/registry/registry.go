@@ -11,9 +11,10 @@ import (
 // Both the TCP & UDP listeners will write to this registry, so it must be thread-safe,
 // therefore we use a mutex
 type Registry struct {
-	mu       sync.RWMutex
-	backends map[string]*BackendEntry // keyed by IP str
-	onRegister []func(BackendEntry) // callback for when a backend is registered
+	mu                sync.RWMutex
+	backends          map[string]*BackendEntry // keyed by IP str
+	onRegister        []func(BackendEntry)     // callback for when a backend is registered
+	onLoadScoreUpdate []func(BackendEntry)     // callback for when a backend's load score is updated
 }
 
 func CreateRegistry() *Registry {
@@ -26,58 +27,82 @@ func CreateRegistry() *Registry {
 // for both TCP and UDP pools. The callback receives a copy of the BackendEntry.
 // Callbacks are invoked without the registry lock held.
 func (r *Registry) OnRegister(fn func(BackendEntry)) {
-    r.mu.Lock()
-    defer r.mu.Unlock()
-    r.onRegister = append(r.onRegister, fn)
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.onRegister = append(r.onRegister, fn)
+}
+
+// OnLoadScoreUpdate installs a callback fired every time a backend's
+// load score changes. The callback receives a copy of the BackendEntry
+// after the update. Hooks are invoked WITHOUT the registry lock held
+func (r *Registry) OnLoadScoreUpdate(fn func(BackendEntry)) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.onLoadScoreUpdate = append(r.onLoadScoreUpdate, fn)
 }
 
 func (r *Registry) RegisterBackendEntry(pool Pool, ip net.IP, port uint16) {
-    r.mu.Lock()
+	r.mu.Lock()
 
-    key := ip.String()
-    current_time := time.Now()
-    if _, ok := r.backends[key]; ok {
-        log.Printf("[REGISTRY] Device tried to register, but already exists: %s:%d (%s)", ip, port, pool)
-        r.mu.Unlock()
-        return
-    }
+	key := ip.String()
+	current_time := time.Now()
+	if _, ok := r.backends[key]; ok {
+		log.Printf("[REGISTRY] Device tried to register, but already exists: %s:%d (%s)", ip, port, pool)
+		r.mu.Unlock()
+		return
+	}
 
-    b := &BackendEntry{
-        Pool:       pool,
-        IP:         ip,
-        Port:       port,
-        LoadScore:  1,
-        LastSeen:   current_time,
-        Registered: current_time,
-    }
-    r.backends[key] = b
-    log.Printf("[REGISTRY] Registered device: %s:%d (%s)", ip, port, pool)
+	b := &BackendEntry{
+		Pool:       pool,
+		IP:         ip,
+		Port:       port,
+		LoadScore:  1,
+		LastSeen:   current_time,
+		Registered: current_time,
+	}
+	r.backends[key] = b
+	log.Printf("[REGISTRY] Registered device: %s:%d (%s)", ip, port, pool)
 
-    // Snapshot hooks and copy the entry while holding the lock
-    hooks := make([]func(BackendEntry), len(r.onRegister))
-    copy(hooks, r.onRegister)
-    entryCopy := *b
+	// Snapshot hooks and copy the entry while holding the lock
+	hooks := make([]func(BackendEntry), len(r.onRegister))
+	copy(hooks, r.onRegister)
+	entryCopy := *b
 
-    r.mu.Unlock()
+	r.mu.Unlock()
 
-    // Start hooks without the lock held
-    for _, fn := range hooks {
-        fn(entryCopy)
-    }
+	// Start hooks without the lock held
+	for _, fn := range hooks {
+		fn(entryCopy)
+	}
 }
 
 // UpdateLoadScore sets the load score and refreshes LastSeen for the backend
 // at the given IP. Returns false if the backend isn't registered.
 func (r *Registry) UpdateLoadScore(ip net.IP, score uint32) bool {
 	r.mu.Lock()
-	defer r.mu.Unlock()
 
-	if b, ok := r.backends[ip.String()]; ok {
-		b.LoadScore = score
-		b.LastSeen = time.Now()
-		return true
+	b, ok := r.backends[ip.String()]
+	if !ok {
+		r.mu.Unlock()
+		return false
 	}
-	return false
+
+	b.LoadScore = score
+	b.LastSeen = time.Now()
+
+	// Snapshot for hooks
+	hooks := make([]func(BackendEntry), len(r.onLoadScoreUpdate))
+	copy(hooks, r.onLoadScoreUpdate)
+	entryCopy := *b
+
+	r.mu.Unlock()
+
+	// Fire callbacks for updating the bpf map without holding the lock
+	for _, fn := range hooks {
+		fn(entryCopy)
+	}
+
+	return true
 }
 
 // Removes a backend keyed by IPfrom the registry.
