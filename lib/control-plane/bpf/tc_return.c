@@ -5,18 +5,20 @@
 #include <bpf/bpf_endian.h>
 
 #define ETH_P_IP    0x0800
-#define IPPROTO_TCP 6
 #define TC_ACT_OK   0
 
-// Counter indices
-#define TCNT_TOTAL          0
-#define TCNT_NON_IP         1
-#define TCNT_TO_LB          2
-#define TCNT_TCP_REWRITTEN  3
-#define TCNT_NO_BACKEND     4
-#define TCNT_OTHER_PROTO    5
-#define TCNT_TOO_SHORT      6
-#define TCNT_MAX            7
+// -------- Counters -----------------------------------──
+#define TCNT_TOTAL              0
+#define TCNT_NON_IP             1
+#define TCNT_TO_LB              2
+#define TCNT_TCP_REWRITTEN      3
+#define TCNT_CT_MISS            4
+#define TCNT_OTHER_PROTO        5
+#define TCNT_TOO_SHORT          6
+#define TCNT_FIB_FAILED         7
+#define TCNT_MAX                8
+
+#define ENP7S0_IFINDEX 2
 
 struct backend_entry {
     __u32 ip;
@@ -26,7 +28,21 @@ struct backend_entry {
     __u32 _pad2;
 };
 
-// Maps shared with XDP via the loader's MapReplacements mechanism
+struct flow_key {
+    __u32 src_ip;
+    __u32 dst_ip;
+    __u16 src_port;
+    __u16 dst_port;
+    __u8  proto;
+    __u8  _pad[3];
+};
+
+struct ct_value {
+    __u32 backend_slot;
+};
+
+// -------- Maps (shared with XDP) ---------------------------
+
 struct {
     __uint(type, BPF_MAP_TYPE_ARRAY);
     __uint(max_entries, 64);
@@ -34,7 +50,7 @@ struct {
     __type(value, struct backend_entry);
 } tcp_pool SEC(".maps");
 
-// UDP backend pool — same shape
+
 struct {
     __uint(type, BPF_MAP_TYPE_ARRAY);
     __uint(max_entries, 64);
@@ -49,13 +65,21 @@ struct {
     __type(value, __u32);
 } pool_meta SEC(".maps");
 
-// Separate maps that TC populates from the loader (not shared with XDP)
 struct {
     __uint(type, BPF_MAP_TYPE_ARRAY);
     __uint(max_entries, 1);
     __type(key, __u32);
     __type(value, __u32);
 } vip_map SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(max_entries, 16384);
+    __type(key, struct flow_key);
+    __type(value, struct ct_value);
+} tcp_conntrack_reverse SEC(".maps");
+
+// -------- Maps (TC-only) -----------------------------------──
 
 struct {
     __uint(type, BPF_MAP_TYPE_ARRAY);
@@ -134,28 +158,27 @@ int tc_return(struct __sk_buff *skb) {
         return TC_ACT_OK;
     }
 
-    // Check if the source IP matches our backend (only one for now, slot 0).
-    __u32 tcp_idx = 0;
-    __u32 *tcp_active = bpf_map_lookup_elem(&pool_meta, &tcp_idx);
-    if (!tcp_active || *tcp_active == 0) {
-        inc_counter(TCNT_NO_BACKEND);
-        bpf_printk("TC: no active backends in TCP pool, skipping rewrite");
+    // Look up reverse conntrack
+    struct flow_key rev_key = {
+        .src_ip   = ip->saddr,
+        .dst_ip   = ip->daddr,
+        .src_port = tcp->source,
+        .dst_port = tcp->dest,
+        .proto    = IPPROTO_TCP,
+    };
+
+    struct ct_value *ct = bpf_map_lookup_elem(&tcp_conntrack_reverse, &rev_key);
+    if (!ct) {
+        // No conntrack — this packet isn't part of a flow we manage.
+        // Could be: a backend talking to something else, or a stale packet.
+        inc_counter(TCNT_CT_MISS);
         return TC_ACT_OK;
     }
 
-    __u32 slot = 0;
-    struct backend_entry *backend = bpf_map_lookup_elem(&tcp_pool, &slot);
-    if (!backend || backend->ip != ip->saddr) {
-        inc_counter(TCNT_NO_BACKEND);
-        bpf_printk("TC: backend IP mismatch, skipping rewrite");
-        return TC_ACT_OK;
-    }
-
-    // Read VIP and the VIP TCP port we should rewrite source to
+    // Found in conntrack — rewrite source to VIP
     __u32 *vip_ptr = bpf_map_lookup_elem(&vip_map, &key);
     __u32 *vip_port_ptr = bpf_map_lookup_elem(&vip_tcp_port, &key);
     if (!vip_ptr || !vip_port_ptr) {
-        bpf_printk("TC: missing VIP or VIP TCP port, skipping rewrite");
         return TC_ACT_OK;
     }
 
@@ -177,8 +200,8 @@ int tc_return(struct __sk_buff *skb) {
     ip->saddr = new_saddr;
     tcp->source = new_sport;
 
-    //  Update TCP Checksum (Must use BPF_F_PSEUDO_HDR flag when IP changes)
-    // We pass sizeof() so the kernel knows whether we are updating a 32-bit IP or 16-bit port
+    // Update TCP Checksum 
+    // Have to use BPF_F_PSEUDO_HDR flag when IP changes to avoid corruption during hardware checksum offload
     bpf_l4_csum_replace(skb, tcp_csum_offset, old_saddr, new_saddr, BPF_F_PSEUDO_HDR | sizeof(new_saddr));
     bpf_l4_csum_replace(skb, tcp_csum_offset, old_sport, new_sport, sizeof(new_sport));
 
@@ -187,7 +210,6 @@ int tc_return(struct __sk_buff *skb) {
 
     inc_counter(TCNT_TCP_REWRITTEN);
 
-    #define ENP7S0_IFINDEX 2
     
     // Resolve the egress MAC for the destination. Without this, the bridge
     // would forward the frame with the bridge MAC, which the client wouldn't accept.

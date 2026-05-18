@@ -22,6 +22,10 @@ else
     echo "  assigned IP $BR_IP"
 fi
 
+echo "Enabling IPv4 forwarding..."
 sudo sysctl -w net.ipv4.ip_forward=1 > /dev/null
+
+echo "Assigning VIP to enp7s0..."
+sudo ip addr add 192.168.1.100/32 dev enp7s0
 
 echo "$BR_NAME is up at $BR_IP"

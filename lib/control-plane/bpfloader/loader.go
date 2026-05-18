@@ -60,10 +60,11 @@ func New() (*Loader, error) {
 	// reuse the already loaded maps instead of trying to create new ones
 	tcOpts := &ebpf.CollectionOptions{
 		MapReplacements: map[string]*ebpf.Map{
-			"tcp_pool":  l.xdpObjs.TcpPool,
-			"udp_pool":  l.xdpObjs.UdpPool,
-			"pool_meta": l.xdpObjs.PoolMeta,
-			"vip_map":   l.xdpObjs.VipMap,
+			"tcp_pool":              l.xdpObjs.TcpPool,
+			"udp_pool":              l.xdpObjs.UdpPool,
+			"pool_meta":             l.xdpObjs.PoolMeta,
+			"vip_map":               l.xdpObjs.VipMap,
+			"tcp_conntrack_reverse": l.xdpObjs.TcpConntrackReverse,
 		},
 	}
 	if err := loadTcreturnObjects(&l.tcObjs, tcOpts); err != nil {
