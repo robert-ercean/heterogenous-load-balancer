@@ -49,7 +49,7 @@ struct ct_value {
 
 struct {
     __uint(type, BPF_MAP_TYPE_ARRAY);
-    __uint(max_entries, 64);
+    __uint(max_entries, 100);
     __type(key, __u32);
     __type(value, struct backend_entry);
 } tcp_pool SEC(".maps");
@@ -57,7 +57,7 @@ struct {
 
 struct {
     __uint(type, BPF_MAP_TYPE_ARRAY);
-    __uint(max_entries, 64);
+    __uint(max_entries, 100);
     __type(key, __u32);
     __type(value, struct backend_entry);
 } udp_pool SEC(".maps");
