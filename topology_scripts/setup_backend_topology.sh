@@ -140,7 +140,7 @@ for i in "${!TCP_IPS[@]}"; do
     --hostname "tcp-backend-$n" \
     --network lb-backends \
     --ip "$ip" \
-    --cpus "0.6" \
+    --cpus "0.8" \
     --memory "256m" \
     --memory-swap "256m" \
     -v "$TCP_AGENT_BIN:/agent:ro" \
