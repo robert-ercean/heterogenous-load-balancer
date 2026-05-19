@@ -22,7 +22,7 @@
 #define CNT_CT_INSERT_FAIL   12
 #define CNT_MAX              13
 
-__u8 egress_mac[6] = {0xe2, 0xd3, 0x09, 0xe1, 0xfb, 0xea};
+__u8 egress_mac[6] = {0x5e, 0x67, 0xa1, 0x75, 0x67, 0xe6};
 #define EGRESS_IFINDEX 5
 
 // -------- Data structures --------

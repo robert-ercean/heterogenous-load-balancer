@@ -7,18 +7,13 @@ BR_NAME="br0"
 BR_IP="172.16.0.1/24"
 BR_IP_NO_MASK="172.16.0.1"
 
-TCP_IPS=(
-  "172.16.0.10"
-  "172.16.0.11"
-  "172.16.0.12"
-  "172.16.0.13"
-  "172.16.0.14"
-  "172.16.0.15"
-  "172.16.0.16"
-  "172.16.0.17"
-  "172.16.0.18"
-  "172.16.0.19"
-)
+# Generate 100 TCP IPs: 172.16.0.10 -> 172.16.0.109
+TCP_IPS=()
+for i in $(seq 10 109); do
+  TCP_IPS+=("172.16.0.$i")
+done
+
+TCP_LOADS=(20 40 60 80)
 
 : '
 UDP_IPS=(
@@ -35,18 +30,6 @@ UDP_IPS=(
 )
 
 '
-TCP_WORKLOADS=(
-  "idle"
-  "idle"
-  "idle"
-  "idle"
-  "idle"
-  "idle"
-  "idle"
-  "idle"
-  "idle"
-  "idle"
-)
 
 # Where the agent binaries live on the host
 TCP_AGENT_BIN="/home/robert/Desktop/lb/backend_devices_scripts/tcp/register/tcp_register"
@@ -111,43 +94,29 @@ done
 # ─── Step 4: TCP backends ──────────────────────────────────────
 echo "[4/5] Creating TCP backends..."
 
-
 for i in "${!TCP_IPS[@]}"; do
   n=$((i + 1))
   ip="${TCP_IPS[$i]}"
-  workload="${TCP_WORKLOADS[$i]}"
+  load="${TCP_LOADS[$((i % ${#TCP_LOADS[@]}))]}"
 
-  case "$workload" in
-    cpu)
-      WORKER_CMD="/cpu_work --workers 1 --busy-percent 10 --period-ms 100"
-      ;;
-    idle)
-      WORKER_CMD="tail -f /dev/null"
-      ;;
-    mem)
-      WORKER_CMD="/mem_work --mb 160 --touch-interval-ms 1000"
-      ;;
-    *)
-      echo "ERROR: unknown TCP workload: $workload"
-      exit 1
-      ;;
-  esac
+  WORKER_CMD="/cpu_work --workers 1 --busy-percent $load --period-ms 100"
 
-  echo "      tcp-backend-$n ip=$ip workload=$workload"
+  echo "      tcp-backend-$n ip=$ip load=$load"
 
   docker run -d \
     --name "tcp-backend-$n" \
     --hostname "tcp-backend-$n" \
     --network lb-backends \
     --ip "$ip" \
-    --cpus "0.8" \
+    --cpus "0.1" \
     --memory "256m" \
     --memory-swap "256m" \
     -v "$TCP_AGENT_BIN:/agent:ro" \
     -v "$TCP_CPU_WORK_BIN:/cpu_work:ro" \
     -v "$TCP_MEM_WORK_BIN:/mem_work:ro" \
-    alpine sh -c "/agent --cp '$CP_HTTP_ADDR' --port 50051 & exec $WORKER_CMD"
+    alpine sh -c "/agent --cp '$CP_HTTP_ADDR' --port 50051 --load $load & exec $WORKER_CMD"
 done
+
 
 # ─── Step 5: UDP backends ──────────────────────────────────────
 echo "[5/5] Creating UDP backends..."
