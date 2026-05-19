@@ -21,6 +21,8 @@
 #define ENP7S0_IFINDEX 2
 __u8 enp7s0_mac[6] = {0x8c, 0x8c, 0xaa, 0xff, 0xdb, 0x3d};
 
+__u8 default_gateway_mac[6] = {0x14, 0x22, 0x33, 0xe7, 0xef, 0x20};
+
 struct backend_entry {
     __u32 ip;           // network byte order
     __u16 port;         // network byte order
@@ -215,23 +217,6 @@ int tc_return(struct __sk_buff *skb) {
     inc_counter(TCNT_TCP_REWRITTEN);
 
     
-    // Resolve the egress MAC for the destination. Without this, the bridge
-    // would forward the frame with the bridge MAC, which the client wouldn't accept.
-    // bpf_fib_lookup gives us src and dst MAC for the egress path.
-    struct bpf_fib_lookup fib = {};
-    fib.family = 2; // AF_INET
-    fib.l4_protocol = proto;
-    fib.tot_len = total_len;
-    fib.ipv4_src = new_saddr;
-    fib.ipv4_dst = dst_addr;
-    fib.ifindex = ENP7S0_IFINDEX;
-
-    int fib_ret = bpf_fib_lookup(skb, &fib, sizeof(fib), 0);
-    if (fib_ret != BPF_FIB_LKUP_RET_SUCCESS) {
-        bpf_printk("TC fib_lookup failed: ret=%d", fib_ret);
-        return TC_ACT_OK;  // fall back to letting the kernel try
-    }
-
     // Rewrite Ethernet MACs for egress.
     // skb->data points to the L2 header; we can write through it.
     void *eth_data = (void *)(long)skb->data;
@@ -241,12 +226,12 @@ int tc_return(struct __sk_buff *skb) {
         return TC_ACT_OK;
     }
     __builtin_memcpy(eth_out->h_source, enp7s0_mac, 6);
-    __builtin_memcpy(eth_out->h_dest, fib.dmac, 6);
+    __builtin_memcpy(eth_out->h_dest, default_gateway_mac, 6);
 
-    bpf_printk("TC: redirecting to enp7s0 (ifindex=%d), dst_mac %x:%x:%x:%x:%x:%x",
+    bpf_printk("TC: redirecting to enp7s0 (ifindex=%d), dst_mac(default gateway's) %x:%x:%x:%x:%x:%x",
                ENP7S0_IFINDEX,
-               fib.dmac[0], fib.dmac[1], fib.dmac[2],
-               fib.dmac[3], fib.dmac[4], fib.dmac[5]);
+               default_gateway_mac[0], default_gateway_mac[1], default_gateway_mac[2],
+               default_gateway_mac[3], default_gateway_mac[4], default_gateway_mac[5]);
 
     return bpf_redirect(ENP7S0_IFINDEX, 0);
 }

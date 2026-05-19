@@ -22,8 +22,8 @@
 #define CNT_CT_INSERT_FAIL   12
 #define CNT_MAX              13
 
-__u8 egress_mac[6] = {0xba, 0xc6, 0xbe, 0x41, 0x58, 0xd9};
-#define EGRESS_IFINDEX 4
+__u8 egress_mac[6] = {0xe2, 0xd3, 0x09, 0xe1, 0xfb, 0xea};
+#define EGRESS_IFINDEX 5
 
 // -------- Data structures --------
 
