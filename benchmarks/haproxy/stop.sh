@@ -2,7 +2,7 @@
 
 set -e
 
-CONTAINER="haproxy-benchmark"
+CONTAINER="haproxy"
 
 if docker ps -a --format '{{.Names}}' | grep -q "^${CONTAINER}$"; then
     echo "Stopping ${CONTAINER}..."

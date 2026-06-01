@@ -1,5 +1,5 @@
 sudo docker run -d \
-  --name haproxy-benchmark \
-  --net host \
-  -v $(pwd)/haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro \
+  --name haproxy \
+  -p 5555:5555 \
+  -v "$PWD/haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro" \
   haproxy:latest
