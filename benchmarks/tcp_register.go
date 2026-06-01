@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"flag"
+	"net"
 	"fmt"
 	"log"
 	"net/http"
@@ -42,46 +43,51 @@ var (
 	cpuMu         sync.Mutex
 	lastCPUSample *cpuSample
 
-	// quotaRatio represents the container's CPU allocation as a fraction
-	// of one core. 0.5 = --cpus 0.5, 2.0 = --cpus 2.0.
+	// quotaRatio represents the cgroup's CPU allocation as a fraction
+	// of one core. 0.5 = CPUQuota=50%, 2.0 = CPUQuota=200%.
 	// 0 means unlimited (no cgroup quota set).
 	quotaRatio    float64
 	quotaOnce     sync.Once
-	assigned_load int
 	packetSize    int
+	ipStr string
 )
 
 // ─── Main ────────────────────────────────────────────────────────
 
 func main() {
-	cpu_load := flag.Int("load", 0, "assigned load for this container (0-100)")
-	cpAddr := flag.String("cp", "", "control plane HTTP address, e.g. 172.16.0.1:9998")
+	cpAddr := flag.String("cp", "", "control plane HTTP address, e.g. 172.31.32.187:9998")
+	// should default to 1024 for now
 	packet_size := flag.Int("packet-size", 1024, "size of the payload in bytes")
 	port := flag.Int("port", 50051, "port this backend serves work on")
+	bindIP := flag.String("bind", "0.0.0.0", "IP address to bind work + metrics servers to")
 	retryDelay := flag.Duration("retry", 3*time.Second, "delay between registration retries")
 	maxRetries := flag.Int("max-retries", 0, "max retries (0 = forever)")
 	flag.Parse()
+	ipStr = *bindIP
 	packetSize = *packet_size
-	assigned_load = *cpu_load
-	// skip for now while we're running LVS benchmarks
+	
+	// skip for now while we're running non healthcheck benchmarks
 	if *cpAddr == "" {
 		log.Fatal("--cp flag is required")
 	}
-
-	hostname, _ := os.Hostname()
-
+		
 	// Take an initial CPU sample so the first /metrics call has a baseline to diff against.
 	// Without this, the first poll would always return 0.
 	lastCPUSample = takeCPUSample()
+	hostname, err := os.Hostname()
+	if err != nil {
+		log.Fatalf("failed to get hostname: %v", err)
+	}
+	//Start metrics server in the background (bound to the configured IP, port 8080).
+	metricsAddr := fmt.Sprintf("%s:8080", *bindIP)
+	go startMetricsServer(metricsAddr)
+	
+	// Start the work server bound to the same IP.
+	workAddr := fmt.Sprintf("%s:%d", *bindIP, *port)
+	log.Printf("[tcp_agent] listening work on: %s:%d", ipStr, *port)
+	go startWorkServer(workAddr)
 
-	// Start metrics server in the background
-	metricsPort := ":8080"
-	go startMetricsServer(metricsPort)
-
-	// Start the work server
-	go startWorkServer(*port)
-
-	// Register with the control plane (retrying on failure)
+	// Register with the control plane (retrying on failure).
 	url := fmt.Sprintf("http://%s/register", *cpAddr)
 
 	body, err := json.Marshal(RegisterRequest{
@@ -92,13 +98,14 @@ func main() {
 		log.Fatalf("failed to encode request: %v", err)
 	}
 
-	log.Printf("[tcp_agent %s] starting, will register at %s as port %d", hostname, url, *port)
+	log.Printf("[tcp_agent %s] starting, bind=%s, will register at %s as port %d",
+		hostname, *bindIP, url, *port)
 
 	attempt := 0
 	for {
 		attempt++
 
-		err := tryRegister(url, body)
+		err := tryRegister(url, body, ipStr)
 		if err == nil {
 			log.Printf("[tcp_agent %s] registered successfully (attempt %d)", hostname, attempt)
 			break
@@ -113,7 +120,7 @@ func main() {
 		time.Sleep(*retryDelay)
 	}
 
-	// Stay alive — Docker container would exit otherwise
+	// Stay alive — without this main() would return and kill the goroutines.
 	log.Printf("[tcp_agent %s] registration complete, idling", hostname)
 
 	select {}
@@ -121,11 +128,30 @@ func main() {
 
 // ─── Registration ────────────────────────────────────────────────
 
-func tryRegister(url string, body []byte) error {
-	client := &http.Client{
-		Timeout: 5 * time.Second,
+func tryRegister(url string, body []byte, bindIP string) error {
+	// 1. Parse the string IP into a net.IP object
+	localIP := net.ParseIP(bindIP)
+	if localIP == nil {
+		return fmt.Errorf("invalid bind IP: %s", bindIP)
 	}
 
+	transport := &http.Transport	{
+		Proxy: http.ProxyFromEnvironment,
+		DialContext: (&net.Dialer{
+			Timeout:   30 * time.Second,
+			KeepAlive: 30 * time.Second,
+			LocalAddr: &net.TCPAddr{IP: localIP},
+			DualStack: true,
+		}).DialContext,
+		MaxIdleConns:          100,
+		IdleConnTimeout:       90 * time.Second,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+	}
+
+	client := &http.Client{
+		Transport: transport,
+	}
 	resp, err := client.Post(url, "application/json", bytes.NewReader(body))
 	if err != nil {
 		return fmt.Errorf("HTTP error: %w", err)
@@ -151,11 +177,9 @@ func tryRegister(url string, body []byte) error {
 
 // ─── Work server ────────────────────────────────────────────────
 
-func startWorkServer(port int) {
+func startWorkServer(addr string) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/work", workHandler)
-
-	addr := fmt.Sprintf(":%d", port)
 
 	log.Printf("[tcp_agent] work server listening on %s", addr)
 
@@ -168,22 +192,22 @@ func workHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/octet-stream")
 	w.Header().Set("Content-Length", strconv.Itoa(packetSize))
 
-	payload := bytes.Repeat([]byte("a"), packetSize)
-
+	prefix := fmt.Sprintf("hello from %s || ", ipStr)
+	payload := []byte(prefix + strings.Repeat("x", packetSize-len(prefix)))
+	
 	if _, err := w.Write(payload); err != nil {
 		log.Printf("[tcp_agent] failed to write response: %v", err)
 	}
 }
-
 // ─── Metrics server ──────────────────────────────────────────────
 
-func startMetricsServer(port string) {
+func startMetricsServer(addr string) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/metrics", metricsHandler)
 
-	log.Printf("[tcp_agent] metrics server listening on %s", port)
+	log.Printf("[tcp_agent] metrics server listening on %s", addr)
 
-	if err := http.ListenAndServe(port, mux); err != nil {
+	if err := http.ListenAndServe(addr, mux); err != nil {
 		log.Fatalf("[tcp_agent] metrics server failed: %v", err)
 	}
 }
@@ -208,14 +232,19 @@ func metricsHandler(w http.ResponseWriter, r *http.Request) {
 
 // ─── cgroup v2 readers ───────────────────────────────────────────
 
-// readCgroupCPU returns the container's CPU usage as a percentage of
-// its allocated quota.
+// readCgroupCPU returns this backend's CPU usage as a percentage of its
+// allocated quota.
 //
-// A container with --cpus 0.5 burning a full half-core returns 100.0,
-// not 50.0.
+// A backend with CPUQuota=50% burning a full half-core returns 100.0,
+// not 50.0 — because relative-to-quota is what the load-balancer's
+// scoring should use to compare backends with different allocations.
 //
 // First call returns 0 if no baseline exists. Subsequent calls return
 // the percentage over the interval since the previous call.
+//
+// Reads from /sys/fs/cgroup/cpu.stat which, under a systemd-run scope,
+// resolves to the scope's own cgroup via cgroup-namespace remapping —
+// no need to know the scope path explicitly.
 func readCgroupCPU() float32 {
 	quotaOnce.Do(initQuotaRatio)
 
@@ -240,34 +269,33 @@ func readCgroupCPU() float32 {
 		return 0
 	}
 
-	// Raw percentage of wall-clock time spent on CPU.
-	// Can exceed 100 if using more than one core.
-	raw := (deltaCPUUsec / deltaWallUsec) * 100.0
+	// Raw fraction of wall-clock time spent on CPU. Can exceed 1.0 if the
+	// cgroup is using more than one core (multi-core quota).
+	rawFraction := deltaCPUUsec / deltaWallUsec
 
-	// Normalize against the container's quota so 100% means
-	// "saturating my allocated CPU budget".
-	var pct float64
+	// Normalize against the cgroup's quota so 1.0 = "saturating my budget".
+	var fracOfQuota float64
 
 	if quotaRatio > 0 {
-		pct = raw / quotaRatio
+		fracOfQuota = rawFraction / quotaRatio
 	} else {
-		// No quota set — normalize against host CPU count
-		pct = raw / float64(runtime.NumCPU())
+		// No quota set — normalize against the visible CPU count as a
+		// reasonable fallback (so e.g. on a 4-core box, one core busy = 25%).
+		fracOfQuota = rawFraction / float64(runtime.NumCPU())
 	}
 
-	if pct < 0 {
-		pct = 0
+	if fracOfQuota < 0 {
+		fracOfQuota = 0
+	}
+	if fracOfQuota > 1 {
+		fracOfQuota = 1
 	}
 
-	if pct > 100 {
-		pct = 100
-	}
-
-	return float32(pct)
+	return float32(fracOfQuota * 100.0)
 }
 
-// readCgroupMemory returns the container's memory usage as a percentage of
-// its cgroup memory limit. Returns 0 if no limit is set or files are unreadable.
+// readCgroupMemory returns the cgroup's memory usage as a percentage of
+// its memory limit. Returns 0 if no limit is set or files are unreadable.
 func readCgroupMemory() float32 {
 	current, err := os.ReadFile("/sys/fs/cgroup/memory.current")
 	if err != nil {
@@ -289,7 +317,7 @@ func readCgroupMemory() float32 {
 	limStr := strings.TrimSpace(string(limit))
 
 	if limStr == "max" {
-		// No limit set — can't compute a meaningful percentage
+		// No limit set — can't compute a meaningful percentage.
 		return 0
 	}
 
@@ -307,8 +335,8 @@ func readCgroupMemory() float32 {
 	return float32(pct)
 }
 
-// takeCPUSample reads the current cumulative CPU usage from cgroup v2.
-// Returns nil on error.
+// takeCPUSample reads the current cumulative CPU usage from cgroup v2's
+// cpu.stat. Returns nil on error.
 func takeCPUSample() *cpuSample {
 	data, err := os.ReadFile("/sys/fs/cgroup/cpu.stat")
 	if err != nil {
@@ -344,6 +372,9 @@ func takeCPUSample() *cpuSample {
 
 // initQuotaRatio reads /sys/fs/cgroup/cpu.max once at startup.
 // The cgroup quota doesn't change at runtime, so caching is safe.
+//
+// cpu.max format: "<quota_usec> <period_usec>" or "max <period_usec>".
+// quotaRatio = quota / period (e.g. 30000/100000 = 0.30 for CPUQuota=30%).
 func initQuotaRatio() {
 	data, err := os.ReadFile("/sys/fs/cgroup/cpu.max")
 	if err != nil {

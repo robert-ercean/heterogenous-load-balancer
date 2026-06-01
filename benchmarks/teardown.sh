@@ -1,32 +1,21 @@
-#!/bin/bash
-# teardown.sh — tear down netns backends and LVS config.
-#
-# Usage: sudo ./teardown.sh
+#!/usr/bin/env bash
+set -euo pipefail
 
-set -uo pipefail
+units=$(systemctl list-units 'backend-*.scope' --type=scope --all --no-legend --plain | awk '{print $1}')
 
-N=20
-CLIENT_IFACE="enp7s0"
-
-echo "Clearing IPVS..."
-ipvsadm -C 2>/dev/null || true
-
-
-echo "Stopping backend agent processes..."
-# Stop the systemd transient scopes (CPU-capped cgroups)
-for i in $(seq 0 $((N-1))); do
-    systemctl stop "backend-be${i}.scope" 2>/dev/null || true
-done
-# Belt-and-suspenders: kill any tracked PIDs
-if [ -f /tmp/agents/pids.txt ]; then
-    kill $(cat /tmp/agents/pids.txt) 2>/dev/null || true
-    rm -f /tmp/agents/pids.txt
-fi
-
-echo "Deleting namespaces and veths..."
-for i in $(seq 0 $((N-1))); do
-    ip netns del "be$i" 2>/dev/null || true
-    ip link del "veth$i" 2>/dev/null || true   # peer auto-removed with ns; this clears strays
+for unit in $units; do
+  echo "Killing $unit"
+  systemctl kill "$unit" --kill-who=all --signal=TERM || true
 done
 
-echo "Teardown complete."
+sleep 2
+
+for unit in $units; do
+  if systemctl is-active --quiet "$unit"; then
+    echo "Force killing $unit"
+    systemctl kill "$unit" --kill-who=all --signal=KILL || true
+  fi
+done
+
+systemctl reset-failed 'backend-*.scope' || true
+rm -rf /tmp/agents/
