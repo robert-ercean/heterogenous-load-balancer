@@ -6,6 +6,9 @@ import (
 	"log"
 	"net"
 	"sync"
+	"bytes"
+    "os"
+    "os/exec"
 
 	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/link"
@@ -21,7 +24,8 @@ type Loader struct {
 
 	xdpLink link.Link
 	tcLink  link.Link
-
+	tcIface    string       // new — used by legacy path for DetachTC
+    tcPinPath  string       // new — used by legacy path for DetachTC
 	// slotMap maps backend IP → BPF map slot for fast load score updates.
 	// Protected by slotMu since SetBackend and UpdateBackendLoadScore
 	// can run from different goroutines.
@@ -95,7 +99,7 @@ func (l *Loader) AttachXDP(ifaceName string) error {
 	link, err := link.AttachXDP(link.XDPOptions{
 		Program:   l.xdpObjs.XdpForward,
 		Interface: iface.Index,
-		Flags:     link.XDPGenericMode,
+		// Flags:     link.XDPGenericMode,
 	})
 	if err != nil {
 		return fmt.Errorf("[BPF_LOADER] attach XDP to %s: %w", ifaceName, err)
@@ -107,6 +111,9 @@ func (l *Loader) AttachXDP(ifaceName string) error {
 }
 
 func (l *Loader) AttachTC(ifaceName string) error {
+	// Try the modern tcx API first (kernel >= 6.6). If it fails because the
+	// kernel doesn't support it, fall back to the legacy clsact+filter approach
+	// via the `tc` command. This keeps both newer and older kernels working.
 	iface, err := net.InterfaceByName(ifaceName)
 	if err != nil {
 		return fmt.Errorf("[BPF_LOADER] interface %s: %w", ifaceName, err)
@@ -117,14 +124,88 @@ func (l *Loader) AttachTC(ifaceName string) error {
 		Interface: iface.Index,
 		Attach:    ebpf.AttachTCXIngress,
 	})
-	if err != nil {
-		return fmt.Errorf("[BPF_LOADER] attach TC ingress to %s: %w", ifaceName, err)
+	if err == nil {
+		l.tcLink = tcLink
+		log.Printf("[BPF_LOADER] TC ingress attached to %s (tcx)", ifaceName)
+		return nil
 	}
 
-	l.tcLink = tcLink
-	log.Printf("[BPF_LOADER] TC ingress attached to %s", ifaceName)
+	// tcx unsupported (typically "tcx not supported (requires >= v6.6)").
+	// Fall back to the legacy clsact + tc filter path.
+	log.Printf("[BPF_LOADER] tcx unavailable (%v), falling back to clsact+tc", err)
 
+	return l.attachTCLegacy(ifaceName)
+}
+
+// attachTCLegacy uses the `tc` userspace tool to install a clsact qdisc on the
+// interface and pin the BPF program as an ingress filter. Requires the BPF
+// object to exist on disk (pinned), since the `tc` command reads from a file
+// path rather than an fd.
+func (l *Loader) attachTCLegacy(ifaceName string) error {
+	// Pin the loaded TC program to a bpffs path so the `tc` command can attach
+	// it by path. The pin survives across runs of the control plane; we unpin
+	// in DetachTC.
+	const pinDir = "/sys/fs/bpf/lb"
+	pinPath := pinDir + "/tc_return"
+
+	if err := os.MkdirAll(pinDir, 0755); err != nil {
+		return fmt.Errorf("[BPF_LOADER] mkdir %s: %w", pinDir, err)
+	}
+
+	// Remove any stale pin from a previous run.
+	_ = os.Remove(pinPath)
+
+	if err := l.tcObjs.TcReturn.Pin(pinPath); err != nil {
+		return fmt.Errorf("[BPF_LOADER] pin TC program to %s: %w", pinPath, err)
+	}
+	l.tcPinPath = pinPath
+
+	// Ensure the clsact qdisc exists on the interface. `tc qdisc add` errors
+	// with "RTNETLINK answers: File exists" if it's already there; we treat
+	// that as success.
+	if out, err := exec.Command("tc", "qdisc", "add", "dev", ifaceName, "clsact").CombinedOutput(); err != nil {
+		if !bytes.Contains(out, []byte("File exists")) {
+			return fmt.Errorf("[BPF_LOADER] tc qdisc add clsact dev %s: %w (output: %s)",
+				ifaceName, err, bytes.TrimSpace(out))
+		}
+	}
+
+	// Attach the pinned BPF program as an ingress filter.
+	//   `da` = "direct action" (let the BPF program's return value be the TC action).
+	//   `pinned <path>` = load the program from bpffs rather than an .o file.
+	out, err := exec.Command("tc", "filter", "add", "dev", ifaceName,
+		"ingress", "bpf", "da", "pinned", pinPath).CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("[BPF_LOADER] tc filter add on %s: %w (output: %s)",
+			ifaceName, err, bytes.TrimSpace(out))
+	}
+
+	// Stash the interface so DetachTC can clean up.
+	l.tcIface = ifaceName
+
+	log.Printf("[BPF_LOADER] TC ingress attached to %s (clsact+filter legacy)", ifaceName)
 	return nil
+}
+
+// DetachTC reverses AttachTC. Safe to call even if attach failed partway.
+func (l *Loader) DetachTC() {
+	// tcx path
+	if l.tcLink != nil {
+		_ = l.tcLink.Close()
+		l.tcLink = nil
+		return
+	}
+
+	// legacy path: remove filter, qdisc, and pin
+	if l.tcIface != "" {
+		_ = exec.Command("tc", "filter", "del", "dev", l.tcIface, "ingress").Run()
+		_ = exec.Command("tc", "qdisc", "del", "dev", l.tcIface, "clsact").Run()
+		l.tcIface = ""
+	}
+	if l.tcPinPath != "" {
+		_ = os.Remove(l.tcPinPath)
+		l.tcPinPath = ""
+	}
 }
 
 // SetVIP writes the given IPv4 address into the VIP map.

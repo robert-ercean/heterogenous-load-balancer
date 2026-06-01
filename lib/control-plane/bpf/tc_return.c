@@ -18,10 +18,12 @@
 #define TCNT_FIB_FAILED         7
 #define TCNT_MAX                8
 
-#define ENP7S0_IFINDEX 2
-__u8 enp7s0_mac[6] = {0x8c, 0x8c, 0xaa, 0xff, 0xdb, 0x3d};
+#define ENP39S0_IFINDEX 2
+// 0a:db:92:db:00:01
+__u8 enp39s0_mac[6] = {0x0a, 0xdb, 0x92, 0xdb, 0x00, 0x01};
 
-__u8 default_gateway_mac[6] = {0x14, 0x22, 0x33, 0xe7, 0xef, 0x20};
+//  0a:83:39:fd:55:5d
+__u8 client_mac[6] = {0x0a, 0x83, 0x39, 0xfd, 0x55, 0x5d};
 
 struct backend_entry {
     __u32 ip;           // network byte order
@@ -174,9 +176,12 @@ int tc_return(struct __sk_buff *skb) {
     struct ct_value *ct = bpf_map_lookup_elem(&tcp_conntrack_reverse, &rev_key);
     if (!ct) {
         // No conntrack - this packet isn't part of a flow we manage.
-        bpf_printk("TC: conntrack miss for flow %x:%d -> %x:%d\n",
-                   rev_key.src_ip, bpf_ntohs(rev_key.src_port),
-                   rev_key.dst_ip, bpf_ntohs(rev_key.dst_port));
+        // transform ip's in humande-readable format for logging
+        __u8 *src_ip_bytes = (__u8 *)&rev_key.src_ip;
+        __u8 *dst_ip_bytes = (__u8 *)&rev_key.dst_ip;
+        bpf_printk("TC: conntrack miss for flow %d.%d.%d.%d:%d -> %d.%d.%d.%d:%d\n",
+                   src_ip_bytes[0], src_ip_bytes[1], src_ip_bytes[2], src_ip_bytes[3], bpf_ntohs(rev_key.src_port),
+                   dst_ip_bytes[0], dst_ip_bytes[1], dst_ip_bytes[2], dst_ip_bytes[3], bpf_ntohs(rev_key.dst_port));
         inc_counter(TCNT_CT_MISS);
         return TC_ACT_OK;
     }
@@ -225,15 +230,15 @@ int tc_return(struct __sk_buff *skb) {
     if ((void *)(eth_out + 1) > eth_end) {
         return TC_ACT_OK;
     }
-    __builtin_memcpy(eth_out->h_source, enp7s0_mac, 6);
-    __builtin_memcpy(eth_out->h_dest, default_gateway_mac, 6);
+    __builtin_memcpy(eth_out->h_source, enp39s0_mac, 6);
+    __builtin_memcpy(eth_out->h_dest, client_mac, 6);
 
-    bpf_printk("TC: redirecting to enp7s0 (ifindex=%d), dst_mac(default gateway's) %x:%x:%x:%x:%x:%x",
-               ENP7S0_IFINDEX,
-               default_gateway_mac[0], default_gateway_mac[1], default_gateway_mac[2],
-               default_gateway_mac[3], default_gateway_mac[4], default_gateway_mac[5]);
+    bpf_printk("TC: redirecting to enp39s0 (ifindex=%d), dst_mac(client's) %x:%x:%x:%x:%x:%x",
+               ENP39S0_IFINDEX,
+               client_mac[0], client_mac[1], client_mac[2],
+               client_mac[3], client_mac[4], client_mac[5]);
 
-    return bpf_redirect(ENP7S0_IFINDEX, 0);
+    return bpf_redirect(ENP39S0_IFINDEX, 0);
 }
 
 char _license[] SEC("license") = "GPL";

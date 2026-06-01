@@ -1,6 +1,7 @@
 lib/control-plane/bpfloader/xdpforward*
 lib/control-plane/bpfloader/tcreturn*
+lib/control-plane/bpfloader/xdpreturn*
 lib/control-plane/control-plane
-lib/control-plane/control_plane
+lib/control-plane/control_plane/bpf/include/vmlinux.h
 backend_devices_scripts
 *.o

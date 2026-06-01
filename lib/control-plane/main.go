@@ -19,12 +19,12 @@ import (
 
 const (
 	reportIntervalSec      = 10 * time.Second
-	backendFacingInterface = "br0"
-	VIPInterface           = "enp7s0"
-	vipStr                 = "192.168.1.100"
+	backendFacingInterface = "enp40s0"
+	VIPInterface           = "enp39s0"
+	vipStr                 = "172.31.41.174"
 	UDPlistenPort          = ":9999"
 	HTTPlistenPort         = ":9998"
-	LBBridgeIP             = "172.16.0.1"
+	LBBridgeIP             = "172.31.32.187"
 	VIPTCPPort             = 5555
 )
 
@@ -61,7 +61,7 @@ func main() {
 	if err := loader.AttachTC(backendFacingInterface); err != nil {
 		log.Fatalf("[MAIN] failed to attach TC hook: %v", err)
 	}
-
+	defer loader.DetachTC() 
 	reg.OnRegister(func(b registry.BackendEntry) {
 		var pool bpfloader.Pool
 		switch b.Pool {

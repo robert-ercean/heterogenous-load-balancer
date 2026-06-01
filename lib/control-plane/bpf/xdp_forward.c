@@ -22,8 +22,8 @@
 #define CNT_CT_INSERT_FAIL   12
 #define CNT_MAX              13
 
-__u8 egress_mac[6] = {0x5e, 0x67, 0xa1, 0x75, 0x67, 0xe6};
-#define EGRESS_IFINDEX 5
+__u8 egress_mac[6] = {0x0a, 0x30, 0xbd, 0x9d, 0x57, 0xcd};
+#define EGRESS_IFINDEX 3
 
 // -------- Data structures --------
 
@@ -44,6 +44,7 @@ struct flow_key {
     __u16 src_port;
     __u16 dst_port;
     __u8  proto;
+    __u8  pad[3];
 };
 
 // Conntrack value: which backend slot serves this flow.
@@ -221,7 +222,6 @@ int xdp_forward(struct xdp_md *ctx) {
         }
 
         // New flow - SYN present. Pick a backend using the power of two choice principle
-        bpf_printk("XDP: conntrack miss for new flow(got SYN), creating new entry in slot 0 (hardcoded)");
         // Sanity check if there are any active backends in the pool
         __u32 tcp_idx = 0;
         __u32 *active = bpf_map_lookup_elem(&pool_meta, &tcp_idx);
@@ -302,7 +302,9 @@ int xdp_forward(struct xdp_md *ctx) {
     __builtin_memcpy(eth->h_dest, backend->mac, 6);
 
     inc_counter(CNT_VIP_TCP_FORWARDED);
-    bpf_printk("XDP: forwarding packet to backend slot %d at IP %x, port %d", slot, backend->ip, bpf_ntohs(backend->port));
+    // construct human_readable_ip which is ip->daddr in dot-decimal notation, for logging
+    __u8 *ip_bytes = (__u8 *)&backend->ip;
+    bpf_printk("XDP: forwarding packet to backend slot %d at IP %d.%d.%d.%d, port %d", slot, ip_bytes[0], ip_bytes[1], ip_bytes[2], ip_bytes[3], bpf_ntohs(backend->port));
     return bpf_redirect(EGRESS_IFINDEX, 0);
 }
 
