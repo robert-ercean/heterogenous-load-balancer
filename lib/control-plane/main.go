@@ -46,7 +46,7 @@ func main() {
 	if err := loader.SetVIP(net.ParseIP(vipStr)); err != nil {
 		log.Fatalf("[MAIN] set VIP: %v", err)
 	}
-	if err := loader.SetLBBridgeIP(net.ParseIP(LBBridgeIP)); err != nil {
+	if err := loader.SetLBEgressIP(net.ParseIP(LBBridgeIP)); err != nil {
 		log.Fatalf("[MAIN] set LB bridge IP: %v", err)
 	}
 	if err := loader.SetVIPTCPPort(VIPTCPPort); err != nil {
@@ -54,14 +54,14 @@ func main() {
 	}
 
 	// Attach XDP to the specified interface (e.g., "eth0")
-	if err := loader.AttachXDP(VIPInterface); err != nil {
+	if err := loader.AttachXDPForward(VIPInterface); err != nil {
 		log.Fatalf("[MAIN] failed to attach XDP hook: %v", err)
 	}
 
-	if err := loader.AttachTC(backendFacingInterface); err != nil {
-		log.Fatalf("[MAIN] failed to attach TC hook: %v", err)
+	if err := loader.AttachXDPReturn(backendFacingInterface); err != nil {
+		log.Fatalf("[MAIN] failed to attach XDP return hook: %v", err)
 	}
-	defer loader.DetachTC() 
+
 	reg.OnRegister(func(b registry.BackendEntry) {
 		var pool bpfloader.Pool
 		switch b.Pool {

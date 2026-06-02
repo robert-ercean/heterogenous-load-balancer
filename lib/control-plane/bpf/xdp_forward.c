@@ -93,7 +93,7 @@ struct {
 // (client_ip, VIP, client_port, VIP_port, TCP)
 struct {
     __uint(type, BPF_MAP_TYPE_LRU_HASH);
-    __uint(max_entries, (1 << 14)); // ~ 16k entries, evicting least recently used ones when full
+    __uint(max_entries, (1 << 17)); 
     __type(key, struct flow_key);
     __type(value, struct ct_value);
 } tcp_conntrack_forward SEC(".maps");
@@ -102,7 +102,7 @@ struct {
 // (backend_ip, client_ip, backend_port, client_port, TCP)
 struct {
     __uint(type, BPF_MAP_TYPE_LRU_HASH);
-    __uint(max_entries, (1 << 14));
+    __uint(max_entries, (1 << 17));
     __type(key, struct flow_key);
     __type(value, struct ct_value);
 } tcp_conntrack_reverse SEC(".maps");
@@ -207,7 +207,7 @@ int xdp_forward(struct xdp_md *ctx) {
         // Existing flow - use stored backend
         slot = ct->backend_slot;
         inc_counter(CNT_CT_HIT);
-        bpf_printk("XDP: conntrack hit for existing flow, backend slot=%d", slot);
+        bpf_printk("[XDP_FORWARD]: conntrack hit for existing flow, backend slot=%d", slot);
     } else {
         // No conntrack entry. Is this the start of a new flow?
         // SYN without ACK = first packet of new connection.
@@ -217,7 +217,7 @@ int xdp_forward(struct xdp_md *ctx) {
             // that has no TCP state for this flow.
             // Maybe we should let the kernel handle it? Not sure, since packets are filtered by VIP so I guess not
             inc_counter(CNT_CT_MISS_ORPHAN);
-            bpf_printk("XDP: orphan packet with no conntrack entry, dropping");
+            bpf_printk("[XDP_FORWARD]: orphan packet with no conntrack entry, dropping");
             return XDP_DROP;
         }
 
@@ -226,7 +226,7 @@ int xdp_forward(struct xdp_md *ctx) {
         __u32 tcp_idx = 0;
         __u32 *active = bpf_map_lookup_elem(&pool_meta, &tcp_idx);
         if (!active || *active == 0) {
-            bpf_printk("XDP: no active backends in TCP pool, dropping packet");
+            bpf_printk("[XDP_FORWARD]: no active backends in TCP pool, dropping packet");
             inc_counter(CNT_NO_BACKEND);
             return XDP_PASS;
         }
@@ -238,7 +238,7 @@ int xdp_forward(struct xdp_md *ctx) {
         struct backend_entry *be2 = bpf_map_lookup_elem(&tcp_pool, &pick2);
         if (!be1 || !be2) {
             inc_counter(CNT_NO_BACKEND);
-            bpf_printk("XDP: no active backends found at random picks, letting kernel handle it");
+            bpf_printk("[XDP_FORWARD]: no active backends found at random picks, letting kernel handle it");
             return XDP_PASS;
         }
         
@@ -247,7 +247,7 @@ int xdp_forward(struct xdp_md *ctx) {
         struct backend_entry *backend = bpf_map_lookup_elem(&tcp_pool, &slot);
         if (!backend) {
             inc_counter(CNT_NO_BACKEND);
-            bpf_printk("XDP: no backend found at selected slot %d, letting kernel handle it", slot);
+            bpf_printk("[XDP_FORWARD]: no backend found at selected slot %d, letting kernel handle it", slot);
             return XDP_PASS;
         }
 
@@ -304,7 +304,7 @@ int xdp_forward(struct xdp_md *ctx) {
     inc_counter(CNT_VIP_TCP_FORWARDED);
     // construct human_readable_ip which is ip->daddr in dot-decimal notation, for logging
     __u8 *ip_bytes = (__u8 *)&backend->ip;
-    bpf_printk("XDP: forwarding packet to backend slot %d at IP %d.%d.%d.%d, port %d", slot, ip_bytes[0], ip_bytes[1], ip_bytes[2], ip_bytes[3], bpf_ntohs(backend->port));
+    bpf_printk("[XDP_FORWARD]: forwarding packet to backend slot %d at IP %d.%d.%d.%d, port %d", slot, ip_bytes[0], ip_bytes[1], ip_bytes[2], ip_bytes[3], bpf_ntohs(backend->port));
     return bpf_redirect(EGRESS_IFINDEX, 0);
 }
 

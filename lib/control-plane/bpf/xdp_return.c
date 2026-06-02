@@ -22,8 +22,8 @@
 // 0a:db:92:db:00:01
 __u8 enp39s0_mac[6] = {0x0a, 0xdb, 0x92, 0xdb, 0x00, 0x01};
 
-//  0a:83:39:fd:55:5d
-__u8 client_mac[6] = {0x0a, 0x83, 0x39, 0xfd, 0x55, 0x5d};
+//  0a:e9:f4:61:78:4d
+__u8 client_mac[6] = {0x0a, 0xe9, 0xf4, 0x61, 0x78, 0x4d};
 
 struct backend_entry {
     __u32 ip;           // network byte order
@@ -80,7 +80,7 @@ struct {
 
 struct {
     __uint(type, BPF_MAP_TYPE_LRU_HASH);
-    __uint(max_entries, 16384);
+    __uint(max_entries, 1 << 17);
     __type(key, struct flow_key);
     __type(value, struct ct_value);
 } tcp_conntrack_reverse SEC(".maps");
@@ -113,58 +113,118 @@ static __always_inline void inc_counter(__u32 idx) {
     if (c) __sync_fetch_and_add(c, 1);
 }
 
-SEC("tc")
-int tc_return(struct __sk_buff *skb) {
-    void *data = (void *)(long)skb->data;
-    void *data_end = (void *)(long)skb->data_end;
+/*
+ * Incremental checksum update for 16-bit field replacement.
+ *
+ * Equivalent in spirit to:
+ *   bpf_l4_csum_replace(... old16, new16 ...)
+ *
+ * Works for TCP checksum source-port update.
+ */
+static __always_inline __u16 csum_replace16(__u16 csum, __u16 old, __u16 new)
+{
+    __u32 sum;
+
+    sum = (~csum) & 0xffff;
+    sum += (~old) & 0xffff;
+    sum += new;
+
+    sum = (sum & 0xffff) + (sum >> 16);
+    sum = (sum & 0xffff) + (sum >> 16);
+
+    return ~sum;
+}
+
+/*
+ * Incremental checksum update for 32-bit field replacement.
+ *
+ * Equivalent in spirit to:
+ *   bpf_l3_csum_replace(... old32, new32 ...)
+ * and:
+ *   bpf_l4_csum_replace(... old32, new32, BPF_F_PSEUDO_HDR ...)
+ *
+ * Used for IPv4 source-address update and TCP pseudo-header update.
+ */
+static __always_inline __u16 csum_replace32(__u16 csum, __be32 old, __be32 new)
+{
+    __u32 sum;
+    __u16 old_hi = (__u16)(old >> 16);
+    __u16 old_lo = (__u16)(old & 0xffff);
+    __u16 new_hi = (__u16)(new >> 16);
+    __u16 new_lo = (__u16)(new & 0xffff);
+
+    sum = (~csum) & 0xffff;
+    sum += (~old_hi) & 0xffff;
+    sum += new_hi;
+    sum += (~old_lo) & 0xffff;
+    sum += new_lo;
+
+    sum = (sum & 0xffff) + (sum >> 16);
+    sum = (sum & 0xffff) + (sum >> 16);
+
+    return ~sum;
+}
+
+SEC("xdp")
+int xdp_return(struct xdp_md *ctx)
+{
+    void *data = (void *)(long)ctx->data;
+    void *data_end = (void *)(long)ctx->data_end;
 
     inc_counter(TCNT_TOTAL);
 
     struct ethhdr *eth = data;
     if ((void *)(eth + 1) > data_end) {
         inc_counter(TCNT_TOO_SHORT);
-        return TC_ACT_OK;
+        return XDP_PASS;
     }
 
     if (eth->h_proto != bpf_htons(ETH_P_IP)) {
         inc_counter(TCNT_NON_IP);
-        return TC_ACT_OK;
+        return XDP_PASS;
     }
 
     struct iphdr *ip = (struct iphdr *)(eth + 1);
     if ((void *)(ip + 1) > data_end) {
         inc_counter(TCNT_TOO_SHORT);
-        return TC_ACT_OK;
+        return XDP_PASS;
     }
 
     if (ip->ihl < 5) {
         inc_counter(TCNT_TOO_SHORT);
-        return TC_ACT_OK;
+        return XDP_PASS;
+    }
+
+    __u32 ip_hdr_len = ip->ihl * 4;
+
+    if ((void *)ip + ip_hdr_len > data_end) {
+        inc_counter(TCNT_TOO_SHORT);
+        return XDP_PASS;
     }
 
     // If destination is the LB's bridge IP, this is control plane
-    // traffic (heartbeats, health responses). Pass through unchanged.
+    // traffic: heartbeats, health responses, etc.
+    // Pass through unchanged.
     __u32 key = 0;
     __u32 *bridge_ip = bpf_map_lookup_elem(&lb_bridge_ip, &key);
     if (bridge_ip && ip->daddr == *bridge_ip) {
         inc_counter(TCNT_TO_LB);
-        return TC_ACT_OK;   
+        return XDP_PASS;
     }
 
-    // Only handle TCP for now
+    // Only handle TCP for now.
     if (ip->protocol != IPPROTO_TCP) {
         inc_counter(TCNT_OTHER_PROTO);
-        return TC_ACT_OK;
+        return XDP_PASS;
     }
 
-    __u32 ip_hdr_len = ip->ihl * 4;
     struct tcphdr *tcp = (struct tcphdr *)((void *)ip + ip_hdr_len);
     if ((void *)(tcp + 1) > data_end) {
         inc_counter(TCNT_TOO_SHORT);
-        return TC_ACT_OK;
+        return XDP_PASS;
     }
 
-    // Look up reverse conntrack
+    // Look up reverse conntrack.
     struct flow_key rev_key = {
         .src_ip   = ip->saddr,
         .dst_ip   = ip->daddr,
@@ -175,65 +235,62 @@ int tc_return(struct __sk_buff *skb) {
 
     struct ct_value *ct = bpf_map_lookup_elem(&tcp_conntrack_reverse, &rev_key);
     if (!ct) {
-        // No conntrack - this packet isn't part of a flow we manage.
-        // transform ip's in humande-readable format for logging
         __u8 *src_ip_bytes = (__u8 *)&rev_key.src_ip;
         __u8 *dst_ip_bytes = (__u8 *)&rev_key.dst_ip;
-        bpf_printk("TC: conntrack miss for flow %d.%d.%d.%d:%d -> %d.%d.%d.%d:%d\n",
-                   src_ip_bytes[0], src_ip_bytes[1], src_ip_bytes[2], src_ip_bytes[3], bpf_ntohs(rev_key.src_port),
-                   dst_ip_bytes[0], dst_ip_bytes[1], dst_ip_bytes[2], dst_ip_bytes[3], bpf_ntohs(rev_key.dst_port));
+
+        bpf_printk("[XDP_RETURN]: conntrack miss for flow %d.%d.%d.%d:%d -> %d.%d.%d.%d:%d\n",
+                   src_ip_bytes[0], src_ip_bytes[1],
+                   src_ip_bytes[2], src_ip_bytes[3],
+                   bpf_ntohs(rev_key.src_port),
+                   dst_ip_bytes[0], dst_ip_bytes[1],
+                   dst_ip_bytes[2], dst_ip_bytes[3],
+                   bpf_ntohs(rev_key.dst_port));
+
         inc_counter(TCNT_CT_MISS);
-        return TC_ACT_OK;
+        return XDP_PASS;
     }
 
-    // Found in conntrack - rewrite source to VIP
+    // Found in conntrack - rewrite source to VIP.
     __u32 *vip_ptr = bpf_map_lookup_elem(&vip_map, &key);
     __u32 *vip_port_ptr = bpf_map_lookup_elem(&vip_tcp_port, &key);
     if (!vip_ptr || !vip_port_ptr) {
-        return TC_ACT_OK;
+        bpf_printk("[XDP_RETURN]: VIP or VIP port not found\n");
+        return XDP_PASS;
     }
-
-    __u32 new_saddr = *vip_ptr;
-    __be16 new_sport = bpf_htons((__u16)*vip_port_ptr);
 
     __be32 old_saddr = ip->saddr;
     __be16 old_sport = tcp->source;
 
-    __u8 proto = ip->protocol;
-    __u16 total_len = bpf_ntohs(ip->tot_len);
-    __be32 dst_addr = ip->daddr;
+    __be32 new_saddr = *vip_ptr;
+    __be16 new_sport = bpf_htons((__u16)*vip_port_ptr);
 
-    // Rewrite
-    // Calculate the exact byte offsets from the start of the packet
-    __u32 ip_csum_offset = sizeof(struct ethhdr) + offsetof(struct iphdr, check);
-    __u32 tcp_csum_offset = sizeof(struct ethhdr) + ip_hdr_len + offsetof(struct tcphdr, check);
+    /*
+     * XDP cannot use bpf_l3_csum_replace() or bpf_l4_csum_replace()
+     * because those are SKB/TC helpers.
+     *
+     * So we update the checksums manually before or after direct writes.
+     */
 
+    // Update IP header checksum for source-address change.
+    ip->check = csum_replace32(ip->check, old_saddr, new_saddr);
+
+    // Update TCP checksum for IPv4 pseudo-header source-address change.
+    tcp->check = csum_replace32(tcp->check, old_saddr, new_saddr);
+
+    // Update TCP checksum for TCP source-port change.
+    tcp->check = csum_replace16(tcp->check, old_sport, new_sport);
+
+    // Rewrite packet fields.
     ip->saddr = new_saddr;
     tcp->source = new_sport;
 
-    // Update TCP Checksum 
-    // Have to use BPF_F_PSEUDO_HDR flag when IP changes to avoid corruption during hardware checksum offload
-    bpf_l4_csum_replace(skb, tcp_csum_offset, old_saddr, new_saddr, BPF_F_PSEUDO_HDR | sizeof(new_saddr));
-    bpf_l4_csum_replace(skb, tcp_csum_offset, old_sport, new_sport, sizeof(new_sport));
-
-    //  Update IP Checksum
-    bpf_l3_csum_replace(skb, ip_csum_offset, old_saddr, new_saddr, sizeof(new_saddr));
-
     inc_counter(TCNT_TCP_REWRITTEN);
 
-    
     // Rewrite Ethernet MACs for egress.
-    // skb->data points to the L2 header; we can write through it.
-    void *eth_data = (void *)(long)skb->data;
-    void *eth_end = (void *)(long)skb->data_end;
-    struct ethhdr *eth_out = eth_data;
-    if ((void *)(eth_out + 1) > eth_end) {
-        return TC_ACT_OK;
-    }
-    __builtin_memcpy(eth_out->h_source, enp39s0_mac, 6);
-    __builtin_memcpy(eth_out->h_dest, client_mac, 6);
+    __builtin_memcpy(eth->h_source, enp39s0_mac, 6);
+    __builtin_memcpy(eth->h_dest, client_mac, 6);
 
-    bpf_printk("TC: redirecting to enp39s0 (ifindex=%d), dst_mac(client's) %x:%x:%x:%x:%x:%x",
+    bpf_printk("[XDP_RETURN]: redirecting to enp39s0 ifindex=%d, dst_mac(client) %x:%x:%x:%x:%x:%x\n",
                ENP39S0_IFINDEX,
                client_mac[0], client_mac[1], client_mac[2],
                client_mac[3], client_mac[4], client_mac[5]);
