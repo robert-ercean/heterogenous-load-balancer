@@ -6,7 +6,7 @@
 set -euo pipefail
 
 VIP="172.31.42.58"        # VIP clients hit
-VPORT=5555
+VPORT=7777                # Updated for your UDP test
 BACKENDS_PORT=50051
 
 CLIENT_IFACE="ens5"     # client-facing interface
@@ -58,11 +58,12 @@ fi
 
 # Configure IPVS
 ipvsadm -C
-ipvsadm -A -t "${VIP}:${VPORT}" -s "$SCHEDULER"
+# Notice the -u here for UDP
+ipvsadm -A -u "${VIP}:${VPORT}" -s "$SCHEDULER"
 
 for rip in "${BACKENDS[@]}"; do
-    # -m = NAT/masquerade mode
-    ipvsadm -a -t "${VIP}:${VPORT}" -r "${rip}:${BACKENDS_PORT}" -m
+    # -m = NAT/masquerade mode, and notice the -u here for UDP
+    ipvsadm -a -u "${VIP}:${VPORT}" -r "${rip}:${BACKENDS_PORT}" -m
 done
 
 echo "IPVS configured (scheduler=$SCHEDULER, ${#BACKENDS[@]} backends, NAT mode):"
@@ -70,4 +71,4 @@ ipvsadm -L -n
 
 echo ""
 echo "Live connection stats:  watch -n1 'sudo ipvsadm -L -n --stats'"
-echo "Test:                   curl http://${VIP}:${VPORT}/work"
+echo "Test:                 echo 'test' | nc -u ${VIP} ${VPORT}"

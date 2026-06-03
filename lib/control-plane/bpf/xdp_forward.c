@@ -14,15 +14,16 @@
 #define CNT_TOO_SHORT         4
 #define CNT_NON_IP            5
 #define CNT_VIP_TCP_FORWARDED 6
-#define CNT_CT_HIT            7   // forward conntrack lookup hit
-#define CNT_CT_MISS_NEW       8   // miss + SYN → new conntrack entry
-#define CNT_CT_MISS_ORPHAN    9   // miss + non-SYN → dropped
+#define CNT_CT_HIT            7
+#define CNT_CT_MISS_NEW       8
+#define CNT_CT_MISS_ORPHAN    9
 #define CNT_FIB_FAILED       10
 #define CNT_NO_BACKEND       11
 #define CNT_CT_INSERT_FAIL   12
-#define CNT_MAX              13
-
-__u8 egress_mac[6] = {0x0a, 0x30, 0xbd, 0x9d, 0x57, 0xcd};
+#define CNT_VIP_UDP_FORWARDED 13
+#define CNT_MAX              14
+// aka ens6
+__u8 egress_mac[6] = {0x0a, 0x3e, 0xfb, 0x5e, 0x26, 0x31};
 #define EGRESS_IFINDEX 3
 
 // -------- Data structures --------
@@ -93,7 +94,7 @@ struct {
 // (client_ip, VIP, client_port, VIP_port, TCP)
 struct {
     __uint(type, BPF_MAP_TYPE_LRU_HASH);
-    __uint(max_entries, (1 << 17)); 
+    __uint(max_entries, (1 << 24)); 
     __type(key, struct flow_key);
     __type(value, struct ct_value);
 } tcp_conntrack_forward SEC(".maps");
@@ -102,10 +103,26 @@ struct {
 // (backend_ip, client_ip, backend_port, client_port, TCP)
 struct {
     __uint(type, BPF_MAP_TYPE_LRU_HASH);
-    __uint(max_entries, (1 << 17));
+    __uint(max_entries, (1 << 24));
     __type(key, struct flow_key);
     __type(value, struct ct_value);
 } tcp_conntrack_reverse SEC(".maps");
+
+
+// UDP Conntrack
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(max_entries, (1 << 24)); 
+    __type(key, struct flow_key);
+    __type(value, struct ct_value);
+} udp_conntrack_forward SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(max_entries, (1 << 24));
+    __type(key, struct flow_key);
+    __type(value, struct ct_value);
+} udp_conntrack_reverse SEC(".maps");
 
 // -------- Helpers ----------------------------------------
 
@@ -135,6 +152,100 @@ static __always_inline __u16 csum_replace_u16(__u16 old_csum, __u16 old_val, __u
     while (sum >> 16) sum = (sum & 0xFFFF) + (sum >> 16);
     return (__u16)~sum;
 }
+
+static __always_inline int handle_udp_forward(struct xdp_md *ctx, struct iphdr *ip, struct ethhdr *eth, void *data_end, __u32 ip_hdr_len) {
+    bpf_printk("[XDP_FORWARD]: handling UDP packet for VIP");
+    struct udphdr *udp = (struct udphdr *)((void *)ip + ip_hdr_len);
+    if ((void *)(udp + 1) > data_end) {
+        inc_counter(CNT_TOO_SHORT);
+        return XDP_PASS;
+    }
+
+
+    struct flow_key fwd_key;
+    __builtin_memset(&fwd_key, 0, sizeof(fwd_key)); // Zero padding to prevent hash misses
+    fwd_key.src_ip   = ip->saddr;
+    fwd_key.dst_ip   = ip->daddr;
+    fwd_key.src_port = udp->source;
+    fwd_key.dst_port = udp->dest;
+    fwd_key.proto    = IPPROTO_UDP;
+
+    __u32 slot;
+    struct ct_value *ct = bpf_map_lookup_elem(&udp_conntrack_forward, &fwd_key);
+
+    if (ct) {
+        bpf_printk("[XDP_FORWARD]: UDP conntrack hit for existing flow, backend slot=%d", ct->backend_slot);
+        slot = ct->backend_slot;
+        inc_counter(CNT_CT_HIT);
+    } else {
+        // UDP is connectionless. Every miss is treated as a new flow.
+        bpf_printk("[XDP_FORWARD]: UDP conntrack miss for flow, treating as new flow");
+        __u32 udp_idx = 1; // pool_meta index 1 = UDP
+        __u32 *active = bpf_map_lookup_elem(&pool_meta, &udp_idx);
+        if (!active || *active == 0) {
+            inc_counter(CNT_NO_BACKEND);
+            return XDP_PASS;
+        }
+
+        __u32 active_count = *active;
+        
+        slot = bpf_get_prandom_u32() % active_count;
+        
+        struct backend_entry *backend = bpf_map_lookup_elem(&udp_pool, &slot);
+        if (!backend) {
+            inc_counter(CNT_NO_BACKEND);
+            return XDP_PASS;
+        }
+
+        struct ct_value new_ct = { .backend_slot = slot };
+        if (bpf_map_update_elem(&udp_conntrack_forward, &fwd_key, &new_ct, BPF_ANY) < 0) {
+            inc_counter(CNT_CT_INSERT_FAIL);
+        }
+
+        struct flow_key rev_key;
+        __builtin_memset(&rev_key, 0, sizeof(rev_key));
+        rev_key.src_ip   = backend->ip;
+        rev_key.dst_ip   = ip->saddr;
+        rev_key.src_port = backend->port;
+        rev_key.dst_port = udp->source;
+        rev_key.proto    = IPPROTO_UDP;
+        
+        if (bpf_map_update_elem(&udp_conntrack_reverse, &rev_key, &new_ct, BPF_ANY) < 0) {
+            inc_counter(CNT_CT_INSERT_FAIL);
+        }
+
+        inc_counter(CNT_CT_MISS_NEW);
+    }
+
+    struct backend_entry *backend = bpf_map_lookup_elem(&udp_pool, &slot);
+    if (!backend) {
+        inc_counter(CNT_NO_BACKEND);
+        return XDP_PASS;
+    }
+
+    __be32 old_daddr = ip->daddr;
+    __be16 old_dport = udp->dest;
+
+    ip->daddr = backend->ip;
+    udp->dest = backend->port;
+
+    ip->check = csum_replace_u32(ip->check, old_daddr, backend->ip);
+
+    // UDP checksum is optional in IPv4 (0 means not used)
+    if (udp->check != 0) {
+        udp->check = csum_replace_u32(udp->check, old_daddr, backend->ip);
+        udp->check = csum_replace_u16(udp->check, old_dport, backend->port);
+        // RFC 768: If calculated checksum is 0, it must be transmitted as all ones.
+        if (udp->check == 0) udp->check = 0xFFFF;
+    }
+
+    __builtin_memcpy(eth->h_source, egress_mac, 6);
+    __builtin_memcpy(eth->h_dest, backend->mac, 6);
+    bpf_printk("[XDP_FORWARD]: forwarding UDP packet to backend slot %d at IP %d.%d.%d.%d, port %d", slot, (backend->ip & 0xFF), ((backend->ip >> 8) & 0xFF), ((backend->ip >> 16) & 0xFF), ((backend->ip >> 24) & 0xFF), bpf_ntohs(backend->port));
+    inc_counter(CNT_VIP_UDP_FORWARDED);
+    return bpf_redirect(EGRESS_IFINDEX, 0);
+}
+
 
 // -------- Main program ----------------------------------------
 
@@ -168,19 +279,21 @@ int xdp_forward(struct xdp_md *ctx) {
     }
     __u32 ip_hdr_len = ip->ihl * 4;
 
-    // Only handle TCP for now (UDP added later)
-    if (ip->protocol != IPPROTO_TCP) {
-        if (ip->protocol == IPPROTO_UDP) inc_counter(CNT_UDP);
-        else inc_counter(CNT_OTHER);
-        return XDP_PASS;
-    }
-
+    
     inc_counter(CNT_TCP);
-
+    
     // VIP filter
     __u32 cfg_key = 0;
     __u32 *vip_ptr = bpf_map_lookup_elem(&vip_map, &cfg_key);
     if (!vip_ptr || ip->daddr != *vip_ptr) {
+        return XDP_PASS;
+    }
+
+    if (ip->protocol != IPPROTO_TCP) {
+        if (ip->protocol == IPPROTO_UDP) {
+            return handle_udp_forward(ctx, ip, eth, data_end, ip_hdr_len);
+        }
+        inc_counter(CNT_OTHER);
         return XDP_PASS;
     }
 
@@ -207,7 +320,7 @@ int xdp_forward(struct xdp_md *ctx) {
         // Existing flow - use stored backend
         slot = ct->backend_slot;
         inc_counter(CNT_CT_HIT);
-        bpf_printk("[XDP_FORWARD]: conntrack hit for existing flow, backend slot=%d", slot);
+        // bpf_printk("[XDP_FORWARD]: conntrack hit for existing flow, backend slot=%d", slot);
     } else {
         // No conntrack entry. Is this the start of a new flow?
         // SYN without ACK = first packet of new connection.
@@ -217,7 +330,7 @@ int xdp_forward(struct xdp_md *ctx) {
             // that has no TCP state for this flow.
             // Maybe we should let the kernel handle it? Not sure, since packets are filtered by VIP so I guess not
             inc_counter(CNT_CT_MISS_ORPHAN);
-            bpf_printk("[XDP_FORWARD]: orphan packet with no conntrack entry, dropping");
+            // bpf_printk("[XDP_FORWARD]: orphan packet with no conntrack entry, dropping");
             return XDP_DROP;
         }
 
@@ -226,7 +339,7 @@ int xdp_forward(struct xdp_md *ctx) {
         __u32 tcp_idx = 0;
         __u32 *active = bpf_map_lookup_elem(&pool_meta, &tcp_idx);
         if (!active || *active == 0) {
-            bpf_printk("[XDP_FORWARD]: no active backends in TCP pool, dropping packet");
+            // bpf_printk("[XDP_FORWARD]: no active backends in TCP pool, dropping packet");
             inc_counter(CNT_NO_BACKEND);
             return XDP_PASS;
         }
@@ -238,7 +351,7 @@ int xdp_forward(struct xdp_md *ctx) {
         struct backend_entry *be2 = bpf_map_lookup_elem(&tcp_pool, &pick2);
         if (!be1 || !be2) {
             inc_counter(CNT_NO_BACKEND);
-            bpf_printk("[XDP_FORWARD]: no active backends found at random picks, letting kernel handle it");
+            // bpf_printk("[XDP_FORWARD]: no active backends found at random picks, letting kernel handle it");
             return XDP_PASS;
         }
         
@@ -247,7 +360,7 @@ int xdp_forward(struct xdp_md *ctx) {
         struct backend_entry *backend = bpf_map_lookup_elem(&tcp_pool, &slot);
         if (!backend) {
             inc_counter(CNT_NO_BACKEND);
-            bpf_printk("[XDP_FORWARD]: no backend found at selected slot %d, letting kernel handle it", slot);
+            // bpf_printk("[XDP_FORWARD]: no backend found at selected slot %d, letting kernel handle it", slot);
             return XDP_PASS;
         }
 
@@ -304,7 +417,7 @@ int xdp_forward(struct xdp_md *ctx) {
     inc_counter(CNT_VIP_TCP_FORWARDED);
     // construct human_readable_ip which is ip->daddr in dot-decimal notation, for logging
     __u8 *ip_bytes = (__u8 *)&backend->ip;
-    bpf_printk("[XDP_FORWARD]: forwarding packet to backend slot %d at IP %d.%d.%d.%d, port %d", slot, ip_bytes[0], ip_bytes[1], ip_bytes[2], ip_bytes[3], bpf_ntohs(backend->port));
+    // bpf_printk("[XDP_FORWARD]: forwarding packet to backend slot %d at IP %d.%d.%d.%d, port %d", slot, ip_bytes[0], ip_bytes[1], ip_bytes[2], ip_bytes[3], bpf_ntohs(backend->port));
     return bpf_redirect(EGRESS_IFINDEX, 0);
 }
 

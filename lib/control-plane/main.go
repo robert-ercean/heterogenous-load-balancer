@@ -19,13 +19,14 @@ import (
 
 const (
 	reportIntervalSec      = 10 * time.Second
-	backendFacingInterface = "enp40s0"
-	VIPInterface           = "enp39s0"
-	vipStr                 = "172.31.41.174"
-	UDPlistenPort          = ":9999"
-	HTTPlistenPort         = ":9998"
-	LBBridgeIP             = "172.31.32.187"
+	backendFacingInterface = "ens6"
+	VIPInterface           = "ens5"
+	vipStr                 = "172.31.42.58"
+	UDPlistenAddr          = "172.31.34.223:9999"
+	HTTPlistenAddr         = "172.31.34.223:9998"
+	LBBridgeIP             = "172.31.34.223"
 	VIPTCPPort             = 5555
+	VIPUDPPort             = 7777
 )
 
 func main() {
@@ -51,6 +52,9 @@ func main() {
 	}
 	if err := loader.SetVIPTCPPort(VIPTCPPort); err != nil {
 		log.Fatalf("[MAIN] set VIP TCP port: %v", err)
+	}
+	if err := loader.SetVIPUDPPort(VIPUDPPort); err != nil {
+		log.Fatalf("[MAIN] set VIP UDP port: %v", err)
 	}
 
 	// Attach XDP to the specified interface (e.g., "eth0")
@@ -96,14 +100,14 @@ func main() {
 
 	// Start UDP listener for UDP backends
 	go func() {
-		if err := udplistener.Start(UDPlistenPort, reg); err != nil {
+		if err := udplistener.Start(UDPlistenAddr, reg); err != nil {
 			log.Fatalf("[MAIN] UDP listener failed: %v", err)
 		}
 	}()
 
 	// Start HTTP listener for TCP backends
 	go func() {
-		if err := httplistener.Start(HTTPlistenPort, reg); err != nil {
+		if err := httplistener.Start(HTTPlistenAddr, reg); err != nil {
 			log.Fatalf("[MAIN] HTTP listener failed: %v", err)
 		}
 	}()

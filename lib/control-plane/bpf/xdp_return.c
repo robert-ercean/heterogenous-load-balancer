@@ -16,14 +16,15 @@
 #define TCNT_OTHER_PROTO        5
 #define TCNT_TOO_SHORT          6
 #define TCNT_FIB_FAILED         7
-#define TCNT_MAX                8
+#define TCNT_UDP_REWRITTEN      8
+#define TCNT_MAX                9
 
-#define ENP39S0_IFINDEX 2
-// 0a:db:92:db:00:01
-__u8 enp39s0_mac[6] = {0x0a, 0xdb, 0x92, 0xdb, 0x00, 0x01};
-
+#define ENS5_IFINDEX 2
 //  0a:e9:f4:61:78:4d
-__u8 client_mac[6] = {0x0a, 0xe9, 0xf4, 0x61, 0x78, 0x4d};
+__u8 ens5_mac[6] = {0x0a, 0xe9, 0xf4, 0x61, 0x78, 0x4d};
+
+//  0a:bf:8a:a9:8d:23
+__u8 client_mac[6] = {0x0a, 0xbf, 0x8a, 0xa9, 0x8d, 0x23};
 
 struct backend_entry {
     __u32 ip;           // network byte order
@@ -80,7 +81,7 @@ struct {
 
 struct {
     __uint(type, BPF_MAP_TYPE_LRU_HASH);
-    __uint(max_entries, 1 << 17);
+    __uint(max_entries, 1 << 24);
     __type(key, struct flow_key);
     __type(value, struct ct_value);
 } tcp_conntrack_reverse SEC(".maps");
@@ -107,6 +108,23 @@ struct {
     __type(key, __u32);
     __type(value, __u64);
 } tc_counters SEC(".maps");
+
+
+// New: UDP port for the VIP
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, __u32);
+    __type(value, __u32);
+} vip_udp_port SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(max_entries, 1 << 24);
+    __type(key, struct flow_key);
+    __type(value, struct ct_value);
+} udp_conntrack_reverse SEC(".maps");
+
 
 static __always_inline void inc_counter(__u32 idx) {
     __u64 *c = bpf_map_lookup_elem(&tc_counters, &idx);
@@ -165,6 +183,59 @@ static __always_inline __u16 csum_replace32(__u16 csum, __be32 old, __be32 new)
     return ~sum;
 }
 
+static __always_inline int handle_udp_return(struct xdp_md *ctx, struct iphdr *ip, struct ethhdr *eth, void *data_end, __u32 ip_hdr_len) {
+    struct udphdr *udp = (struct udphdr *)((void *)ip + ip_hdr_len);
+    if ((void *)(udp + 1) > data_end) {
+        inc_counter(TCNT_TOO_SHORT);
+        return XDP_PASS;
+    }
+
+    struct flow_key rev_key;
+    __builtin_memset(&rev_key, 0, sizeof(rev_key));
+    rev_key.src_ip   = ip->saddr;
+    rev_key.dst_ip   = ip->daddr;
+    rev_key.src_port = udp->source;
+    rev_key.dst_port = udp->dest;
+    rev_key.proto    = IPPROTO_UDP;
+
+    struct ct_value *ct = bpf_map_lookup_elem(&udp_conntrack_reverse, &rev_key);
+    if (!ct) {
+        inc_counter(TCNT_CT_MISS);
+        return XDP_PASS;
+    }
+
+    __u32 key = 0;
+    __u32 *vip_ptr = bpf_map_lookup_elem(&vip_map, &key);
+    __u32 *vip_port_ptr = bpf_map_lookup_elem(&vip_udp_port, &key);
+    if (!vip_ptr || !vip_port_ptr) {
+        return XDP_PASS;
+    }
+
+    __be32 old_saddr = ip->saddr;
+    __be16 old_sport = udp->source;
+
+    __be32 new_saddr = *vip_ptr;
+    __be16 new_sport = bpf_htons((__u16)*vip_port_ptr);
+
+    ip->check = csum_replace32(ip->check, old_saddr, new_saddr);
+
+    if (udp->check != 0) {
+        udp->check = csum_replace32(udp->check, old_saddr, new_saddr);
+        udp->check = csum_replace16(udp->check, old_sport, new_sport);
+        if (udp->check == 0) udp->check = 0xFFFF;
+    }
+
+    ip->saddr = new_saddr;
+    udp->source = new_sport;
+
+    inc_counter(TCNT_UDP_REWRITTEN);
+
+    __builtin_memcpy(eth->h_source, ens5_mac, 6);
+    __builtin_memcpy(eth->h_dest, client_mac, 6);
+
+    return bpf_redirect(ENS5_IFINDEX, 0);
+}
+
 SEC("xdp")
 int xdp_return(struct xdp_md *ctx)
 {
@@ -212,8 +283,11 @@ int xdp_return(struct xdp_md *ctx)
         return XDP_PASS;
     }
 
-    // Only handle TCP for now.
+    // Only handle TCP and UDP for now.
     if (ip->protocol != IPPROTO_TCP) {
+        if (ip->protocol == IPPROTO_UDP) {
+            return handle_udp_return(ctx, ip, eth, data_end, ip_hdr_len);
+        }
         inc_counter(TCNT_OTHER_PROTO);
         return XDP_PASS;
     }
@@ -238,13 +312,13 @@ int xdp_return(struct xdp_md *ctx)
         __u8 *src_ip_bytes = (__u8 *)&rev_key.src_ip;
         __u8 *dst_ip_bytes = (__u8 *)&rev_key.dst_ip;
 
-        bpf_printk("[XDP_RETURN]: conntrack miss for flow %d.%d.%d.%d:%d -> %d.%d.%d.%d:%d\n",
-                   src_ip_bytes[0], src_ip_bytes[1],
-                   src_ip_bytes[2], src_ip_bytes[3],
-                   bpf_ntohs(rev_key.src_port),
-                   dst_ip_bytes[0], dst_ip_bytes[1],
-                   dst_ip_bytes[2], dst_ip_bytes[3],
-                   bpf_ntohs(rev_key.dst_port));
+        // bpf_printk("[XDP_RETURN]: conntrack miss for flow %d.%d.%d.%d:%d -> %d.%d.%d.%d:%d\n",
+        //            src_ip_bytes[0], src_ip_bytes[1],
+        //            src_ip_bytes[2], src_ip_bytes[3],
+        //            bpf_ntohs(rev_key.src_port),
+        //            dst_ip_bytes[0], dst_ip_bytes[1],
+        //            dst_ip_bytes[2], dst_ip_bytes[3],
+        //            bpf_ntohs(rev_key.dst_port));
 
         inc_counter(TCNT_CT_MISS);
         return XDP_PASS;
@@ -254,7 +328,7 @@ int xdp_return(struct xdp_md *ctx)
     __u32 *vip_ptr = bpf_map_lookup_elem(&vip_map, &key);
     __u32 *vip_port_ptr = bpf_map_lookup_elem(&vip_tcp_port, &key);
     if (!vip_ptr || !vip_port_ptr) {
-        bpf_printk("[XDP_RETURN]: VIP or VIP port not found\n");
+        // bpf_printk("[XDP_RETURN]: VIP or VIP port not found\n");
         return XDP_PASS;
     }
 
@@ -287,15 +361,15 @@ int xdp_return(struct xdp_md *ctx)
     inc_counter(TCNT_TCP_REWRITTEN);
 
     // Rewrite Ethernet MACs for egress.
-    __builtin_memcpy(eth->h_source, enp39s0_mac, 6);
+    __builtin_memcpy(eth->h_source, ens5_mac, 6);
     __builtin_memcpy(eth->h_dest, client_mac, 6);
 
-    bpf_printk("[XDP_RETURN]: redirecting to enp39s0 ifindex=%d, dst_mac(client) %x:%x:%x:%x:%x:%x\n",
-               ENP39S0_IFINDEX,
-               client_mac[0], client_mac[1], client_mac[2],
-               client_mac[3], client_mac[4], client_mac[5]);
+    // bpf_printk("[XDP_RETURN]: redirecting to ens5 ifindex=%d, dst_mac(client) %x:%x:%x:%x:%x:%x\n",
+    //            ENS5_IFINDEX,
+    //            client_mac[0], client_mac[1], client_mac[2],
+    //            client_mac[3], client_mac[4], client_mac[5]);
 
-    return bpf_redirect(ENP39S0_IFINDEX, 0);
+    return bpf_redirect(ENS5_IFINDEX, 0);
 }
 
 char _license[] SEC("license") = "GPL";

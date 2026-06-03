@@ -68,16 +68,17 @@ func New() (*Loader, error) {
 
 	// We use the same underlying BPF maps in both XDP and TC programs, so we need to tell the TC loader to
 	// reuse the already loaded maps instead of trying to create new ones
-	tcOpts := &ebpf.CollectionOptions{
+	opts := &ebpf.CollectionOptions{
 		MapReplacements: map[string]*ebpf.Map{
 			"tcp_pool":              l.xdpForwardObjs.TcpPool,
 			"udp_pool":              l.xdpForwardObjs.UdpPool,
 			"pool_meta":             l.xdpForwardObjs.PoolMeta,
 			"vip_map":               l.xdpForwardObjs.VipMap,
 			"tcp_conntrack_reverse": l.xdpForwardObjs.TcpConntrackReverse,
+			"udp_conntrack_reverse": l.xdpForwardObjs.UdpConntrackReverse,
 		},
 	}
-	if err := loadXdpreturnObjects(&l.xdpReturnObjs, tcOpts); err != nil {
+	if err := loadXdpreturnObjects(&l.xdpReturnObjs, opts); err != nil {
 		l.xdpForwardObjs.Close()
 		return nil, fmt.Errorf("[BPF_LOADER] load XDP return objects: %w", err)
 	}
@@ -176,6 +177,16 @@ func (l *Loader) SetVIPTCPPort(port uint16) error {
 		return fmt.Errorf("update vip_tcp_port: %w", err)
 	}
 	log.Printf("[bpfloader] VIP TCP port set to %d", port)
+	return nil
+}
+
+func (l *Loader) SetVIPUDPPort(port uint16) error {
+	val := uint32(port)
+	key := uint32(0)
+	if err := l.xdpReturnObjs.VipUdpPort.Update(key, val, ebpf.UpdateAny); err != nil {
+		return fmt.Errorf("update vip_udp_port: %w", err)
+	}
+	log.Printf("[bpfloader] VIP UDP port set to %d", port)
 	return nil
 }
 
