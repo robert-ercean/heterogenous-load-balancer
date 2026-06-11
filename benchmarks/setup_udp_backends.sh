@@ -1,13 +1,13 @@
 #!/bin/bash
-# setup_backends.sh — launch one Go agent per AWS secondary IP.
+# setup_backends.sh — launch one UDP agent per AWS secondary IP.
 #
 # AWS assigns multiple secondary private IPs to the instance's primary ENI.
 # This script discovers them, writes them to a file, then launches one
-# Go agent bound to each, isolated by a per-process systemd cgroup scope
+# UDP agent bound to each, isolated by a per-process systemd cgroup scope
 # with a CPU quota (mirroring Docker --cpus 0.3 / your local netns+quota setup).
 #
 # Usage: sudo ./setup_backends.sh
-#   REGISTER=1 CP_ADDR=<LB_BACKEND_IP>:9998 sudo ./setup_backends.sh
+#   REGISTER=1 CP_ADDR=<LB_BACKEND_IP>:5555 sudo ./setup_backends.sh
 #
 # Each agent listens on the same PORT, but on its own IP. The LB registers
 # 10 backends as (IP, PORT) pairs.
@@ -16,22 +16,22 @@ set -euo pipefail
 
 # ─── Config ───────────────────────────────────────────────
 IFACE="${IFACE:-enp39s0}"                # ENI carrying the secondary IPs
-PORT="${PORT:-50051}"                    # work port (same across all agents)
+PORT="${PORT:-50051}"                    # UDP work port (same across all agents)
 CPU_QUOTA="${CPU_QUOTA:-100%}"            # cgroup CPU cap per backend
 PRIMARY_IP="${PRIMARY_IP:-}"             # optional: explicit primary IP to exclude
                                           # (auto-detected if empty)
 
 # REGISTER selects which binary to use:
-#   0 → tcp_no_regist (standalone, for LVS / nginx / HAProxy benchmarks)
-#   1 → tcp_register  (registers with control plane, for your LB)
+#   0 → udp_no_regist (standalone, for LVS UDP benchmarks)
+#   1 → udp_register  (registers with control plane via UDP protocol, for your LB)
 REGISTER="${REGISTER:-0}"
-CP_ADDR="${CP_ADDR:-172.31.47.230:9998}"
-PACKET_SIZE="${PACKET_SIZE:-1024}"
+CP_ADDR="${CP_ADDR:-172.31.34.223:9999}"
+PACKET_SIZE="${PACKET_SIZE:-1024}"          # Defaulting to 64 bytes for your high-PPS UDP tests
 
-BIN_NO_REG="${BIN_NO_REG:-/home/ec2-user/heterogenous-load-balancer/benchmarks/tcp_no_regist}"
-BIN_REG="${BIN_REG:-/home/ec2-user/heterogenous-load-balancer/benchmarks/tcp_register}"
+BIN_NO_REG="${BIN_NO_REG:-/home/ec2-user/heterogenous-load-balancer/benchmarks/udp_no_regist}"
+BIN_REG="${BIN_REG:-/home/ec2-user/heterogenous-load-balancer/benchmarks/udp_register}"
 
-LOG_DIR="${LOG_DIR:-/tmp/agents}"
+LOG_DIR="${LOG_DIR:-/tmp/udp_agents}"
 IP_LIST_FILE="${IP_LIST_FILE:-${LOG_DIR}/backend_ips.txt}"
 PIDS_FILE="${PIDS_FILE:-${LOG_DIR}/pids.txt}"
 
@@ -42,10 +42,6 @@ mkdir -p "$LOG_DIR"
 # ─── Pick the binary based on REGISTER ────────────────────
 if [ "$REGISTER" = "1" ]; then
     BIN="$BIN_REG"
-    if [ -z "$CP_ADDR" ]; then
-        echo "ERROR: REGISTER=1 requires CP_ADDR=<host:port> (the LB's backend-facing IP+port)" >&2
-        exit 1
-    fi
 else
     BIN="$BIN_NO_REG"
 fi
@@ -56,13 +52,6 @@ if [ ! -x "$BIN" ]; then
 fi
 
 # ─── Discover secondary IPs on the ENI ────────────────────
-# `ip -4 -o addr show dev <IFACE>` prints one IP per line. Each line includes
-# the address as "172.31.X.Y/PREFIX". We want all of them EXCEPT the primary
-# (the one with `metric 512` / `dynamic`, i.e. the DHCP-assigned IP).
-#
-# Detection rule: a line that includes "dynamic" or "metric 512" is the
-# primary; everything else is a secondary IP we care about.
-
 # Find the primary IP if not provided
 if [ -z "$PRIMARY_IP" ]; then
     PRIMARY_IP=$(ip -4 -o addr show dev "$IFACE" \
@@ -95,7 +84,7 @@ echo
 N=0
 for ip in "${SECONDARY_IPS[@]}"; do
     N=$((N + 1))
-    unit="backend-${N}.scope"
+    unit="udp-backend-${N}.scope"
     log="${LOG_DIR}/agent_${ip}.log"
 
     # Build the agent command
@@ -104,11 +93,8 @@ for ip in "${SECONDARY_IPS[@]}"; do
     else
         AGENT_CMD=("$BIN" --port "$PORT" --bind "$ip" --packet-size "$PACKET_SIZE")
     fi
-    # NOTE: --bind is the flag the agent needs to listen on a SPECIFIC IP
-    # rather than all interfaces. If your binary doesn't support it yet, add
-    # it (see notes after the script).
 
-    echo "[$N] launching agent on ${ip}:${PORT}  (quota=${CPU_QUOTA}, unit=${unit})"
+    echo "[$N] launching UDP agent on ${ip}:${PORT}  (quota=${CPU_QUOTA}, unit=${unit})"
     systemd-run --scope --quiet \
         -p "CPUQuota=${CPU_QUOTA}" \
         -u "$unit" \
@@ -118,10 +104,10 @@ for ip in "${SECONDARY_IPS[@]}"; do
 done
 
 echo
-echo "Started $N agents on port $PORT, one per IP, CPU-capped at ${CPU_QUOTA}."
+echo "Started $N UDP agents on port $PORT, one per IP, CPU-capped at ${CPU_QUOTA}."
 echo "  IPs:       $IP_LIST_FILE"
 echo "  Logs:      ${LOG_DIR}/agent_<ip>.log"
 echo "  PIDs:      $PIDS_FILE"
 echo
 echo "Quick test:"
-echo "  curl http://${SECONDARY_IPS[0]}:${PORT}/work"
+echo "  echo 'test' | nc -u ${SECONDARY_IPS[0]} ${PORT}"
